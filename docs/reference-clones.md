@@ -93,14 +93,31 @@ CPU 侧最后一条仍是 `780f3c0a`（x87 `F2XM1`/`FYL2X`/`FYL2XP1`，1,239 行
 |---|---|---|
 | `6a127266` | `cpu_bmi1_aot`：`BLSI`/`BLSMSK`/`BLSR` | 这一轮实现了同样的三条。有意思的是它们的**零输入语义**：三个在源为 0 时都给出定义好的结果，所以不能拒绝，也不能靠 `bsf` 的"未定义"含糊过去 |
 | `b291e792` | VEX.128 `VPADDB`/`VPSUBB`/`VPCMPEQB`/`VPCMPGTB` | 这一轮把 `pcmpeq*`/`pcmpgt*` 做成了一张表（通道宽度 + C 关系），`vpsubb` 也进了 `VEC_INT_ARITH` | 
-| `4ea0c770` | `cpu_avx_test_aot`：`VPTEST`/`VTESTPS`/`VTESTPD` | 我们**还没做**：它写 ZF/CF（CF = `(a & b) == 0`，ZF = `(a & ~b) == 0`），是标志的生产者，所以不能只当一条 SIMD 指令塞进 `vec_line`——要走 `branch.py` 的 `pending`。拒绝面里 270 个 |
+| `4ea0c770` | `cpu_avx_test_aot`：`VPTEST`/`VTESTPS`/`VTESTPD` | 这一轮做了，走 `branch.py` 的 `pending`（`kind == "vtest"`）。**没有照抄它注释里的归属**：SDM 是 `ZF = ((SRC1 AND SRC2) == 0)`、`CF = ((SRC2 AND NOT SRC1) == 0)`，而 VTESTPS/VTESTPD 只比**符号位**。按"CF 是 AND"去接，`jz` 之后整条路是反的，而且在 `vtestps x, x` 上看不出来 |
 
 `4ea0c770` 正好说明这个仓库现在的分层在哪里卡住：**凡是写 EFLAGS 的 SIMD 指令，都不属于"向量段"**。
 `vec_line` 的契约是"不碰标志"，所以 `vtestps`/`vptest`/`vucomiss` 都得在 `branch.py` 里有一条分支；
-`vucomiss` 已经这么做了（`FLOAT_COMPARE` + `kind == "fcom"`），`vtestps` 还没做。
+这一轮 `vtestps`/`vtestpd` 补上了（`kind == "vtest"`），并且在补的过程中被差分纠正了两次语义。
 
 一条**仍然成立**的差异：上游把每一族做成独立文件 + 独立期望文件（`tests/cpu/*_check.py` 逐位比对），
 本仓库是一条 `lift_one` + 一张 `vec_line`。这一轮 `vec_line` 从 120 行长到 400 行，
 表驱动的部分（`VEC_BLEND`/`VEC_UNPACK`/`VEC_SHIFT`/`VEC_CMP_INT`/`VEC_HADD`）开始像一张指令表，
 而"表之外还有分支"的部分（`movlps` 的 VEX 两操作数形式清零、`haddpd` 的排布、`psrad` 的饱和）
 恰恰是最容易错的地方。拆不拆已经不是风格问题，而是"错的时候能不能只读一个文件就知道"。
+
+## 又拉了一次上游：`1a0e506d..e4e2b46d`（160 条提交）
+
+CPU 侧（`tools/cpu_*_aot.py` 与它们的期望文件）在这个区间里只有五条，其余全是
+GPU/着色器、PE 解析、启动诊断与 CLI 加固：
+
+| 上游提交 | 内容 | 与本仓库这一轮的关系 |
+|---|---|---|
+| `5f51daaa` | `op_sqrtsd_q` 不再用"C 符号判断 + `std::sqrt`"，改成用 `_mm_sqrt_sd` **在处理器上执行**：DAZ 下一个负的 denormal 被读成 -0、`SQRTSD` 返回 -0，而 C 的写法给的是 `0xFFF8000000000000`（实数不定值） | **同一处、我们这边还是旧的写法**。`VEC_SQRT` 走 `sqrtf`/`sqrt`，在默认 MXCSR、没有 NaN 载荷与 denormal 的输入上与硬件一致（片段差分 42 条里 `vsqrtps`/`vsqrtss`/`vsqrtsd` 都过），但 DAZ/FTZ 与 NaN quieting **没有进模型**——和 MXCSR 那条边界是同一件事。上游的解法很干脆：不建模，把这条指令交给处理器。这一条记进来是因为它说明"正确舍入"不等于"等价" |
+| `141cc972` | `cpu_sha256_aot`：`SHA256RNDS2`/`SHA256MSG1`/`SHA256MSG2` | 映像里没有（`cover.py` 的拒绝面里一次都没出现），不需要做 |
+| `d2cc0a79` | 在 opt-in 的宿主 CPU profile 下升举 `SGDT`/`SIDT`/`SLDT`/`SMSW`/`STR` | 我们一律拒绝：它们读的是**宿主**的 GDT/IDT，主机上跑的时候答案本来就不同 |
+| `394f24f8` / `267b4be9` | CPU 模糊测试补上 x87 区域与位运算生成器 | 我们的对应物是 `lift.py --limit` 的发射器↔解释器自检 + `diff.py` 的两种粒度；模糊测试只覆盖"我们和我们对齐"，不覆盖"我们和硬件对齐" |
+| `780f3c0a` | `cpu_x87_exp_log_aot`：`F2XM1`/`FYL2X`/`FYL2XP1` | 本仓库的 x87 **仍然完全空白**。这三个函数在 80 位扩展精度里算 `2^x-1` 与 `y·log2(x)`，用 `double` 复现会在第 64 位之后开始偏——整族没做是当前最大的一个"整块空白" |
+
+顺带一条方法论上的对照：上游这一轮连开三条提交（`#2545`/`#2506`/`#1784`）都在**同一件事**上——
+让每一条拒绝都有名字、有期望、有测试。本仓库的对应物是 `cover.py` 的拒绝面直方图与
+`diff.py --snippets`：前者保证"拒绝的原因有名字"，后者保证"接受的指令真被执行过"。

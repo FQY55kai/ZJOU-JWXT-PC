@@ -189,6 +189,37 @@ def condition(pending, suffix):
         if suffix == "ae":
             return "1"
         raise Refused(f"test {suffix}")
+    if kind == "vtest":
+        # PTEST/PTEST-like flags, per SDM: the first operand is the ModRM.reg one
+        # (`a`) and the second the r/m one (`b`).
+        #
+        #   ZF = ((a AND b) == 0)
+        #   CF = ((b AND NOT a) == 0)
+        #
+        # and OF/SF/AF/PF cleared. Not the pair the names suggest: the AND lands
+        # in ZF, the ANDNOT in CF. Written the other way round, every `jz` after
+        # a `vtestps` is inverted — and it looks right on the common
+        # `vtestps x, x` because both forms then agree.
+        if suffix in ("e", "z"):
+            return f"(({a}) == 0)"
+        if suffix in ("ne", "nz"):
+            return f"(({a}) != 0)"
+        if suffix in ("c", "b"):
+            return f"(({b}) == 0)"
+        if suffix in ("nc", "ae"):
+            return f"(({b}) != 0)"
+        if suffix == "be":
+            return f"((({b}) == 0) || (({a}) == 0))"
+        if suffix == "a":
+            return f"((({b}) != 0) && (({a}) != 0))"
+        # The rest were cleared, so they are constants rather than refusals:
+        # `js` after a ptest never branches, `jns` always does, and parity is
+        # even-because-zero.
+        if suffix in ("s", "o", "p", "pe"):
+            return "0"
+        if suffix in ("ns", "no", "np", "po"):
+            return "1"
+        raise Refused(f"vtest {suffix}")
     if kind == "fcom":
         # `ucomiss`/`ucomisd` and their ordered twins, as the four conditions
         # the SDM defines: unordered sets ZF=PF=CF=1, greater clears all three,
@@ -217,6 +248,25 @@ def condition(pending, suffix):
         if suffix == "np":
             return f"!{unordered}"
         raise Refused(f"float compare {suffix}")
+    if kind in ("cmp", "cmp_nocf") and suffix in ("s", "ns"):
+        # `js` after a compare is the sign of the difference, which is not
+        # either operand's sign: `cmp 3, 5` is negative although both are
+        # positive. Computed at the operand width, like every other compare.
+        diff = f"(uint{bits}_t)((uint{bits}_t)({a}) - (uint{bits}_t)({b}))"
+        sign = f"((({diff}) >> {bits - 1}) & 1)"
+        return sign if suffix == "s" else f"!{sign}"
+    if kind == "cmp_nocf":
+        # A `rol`/`ror` in between wrote CF and OF and left ZF/SF alone: only the
+        # equality and the sign bit are still the compare's.
+        raise Refused(f"rotate between the compare and {suffix}")
+    if kind == "cmp" and suffix in ("o", "no"):
+        # Signed overflow of `a - b`: it happens exactly when the operands differ
+        # in sign and the difference disagrees with `a`. Two xors and an and,
+        # which is why it is computed here rather than refused.
+        diff = f"(uint{bits}_t)((uint{bits}_t)({a}) - (uint{bits}_t)({b}))"
+        ovf = (f"(((((uint{bits}_t)({a}) ^ (uint{bits}_t)({b}))"
+               f" & ((uint{bits}_t)({a}) ^ {diff})) >> {bits - 1}) & 1)")
+        return ovf if suffix == "o" else f"!{ovf}"
     if suffix in EQUALITY:
         # The same truncation as the ordering conditions below, and for the same
         # reason. `cmp eax, -1` compares 0xFFFFFFFF against 0xFFFFFFFF and finds
@@ -467,8 +517,18 @@ def lift_function(code, rva):
         if m in ("cmp", "test"):
             snap += 1
             a, b = module.src(ops[0], insn), module.src(ops[1], insn)
-            out.append(f"uint64_t a{snap} = {a}, b{snap} = {b};")
-            pending = (m, f"a{snap}", f"b{snap}", ops[0].size * 8)
+            if m == "test":
+                # `test` 的 ZF/SF 来自 `a & b`，不是来自 `a`。`test byte [rcx+0xb0], 1`
+                # 在那一字节是 2 时 ZF 为 1——只取第一个操作数就是把每一条位测试都做成
+                # "非零即真"，方向正好反了。截到操作数宽度再与，符号位与奇偶位随之正确。
+                bits = ops[0].size * 8
+                wide = f"uint{bits}_t"
+                out.append(f"uint64_t a{snap} = (uint64_t)"
+                           f"(({wide})({a}) & ({wide})({b}));")
+                pending = ("test", f"a{snap}", "0", bits)
+            else:
+                out.append(f"uint64_t a{snap} = {a}, b{snap} = {b};")
+                pending = ("cmp", f"a{snap}", f"b{snap}", ops[0].size * 8)
             continue
         if m in module.FLOAT_COMPARE:
             # The two low lanes, snapshotted as C floats: a `mov` between the
@@ -481,6 +541,46 @@ def lift_function(code, rva):
             out.append(f"{ctype} f{snap} = {module.float_operand(ops[0], size, insn)}"
                        f", g{snap} = {module.float_operand(ops[1], size, insn)};")
             pending = ("fcom", f"f{snap}", f"g{snap}", size * 8)
+            continue
+        if m in ("ptest", "vtestps", "vtestpd"):
+            # 它写 CF 与 ZF，所以不能只当一条 SIMD 指令塞进 `vec_line`——那条路的
+            # 契约是"不碰标志"。
+            #
+            # 而且 VTESTPS/VTESTPD 只比**符号位**：SDM 说的是 "bitwise comparison
+            # of all the sign bits of the packed elements"，不是整字的与。小端下
+            # 每个 32 位元素的符号位落在该元素第 4 个字节的最高位，pd 是第 8 个
+            # 字节。按整字算（`ptest` 的算法）会在两个同号数上给出相反答案。
+            if len(ops) != 2:
+                raise Refused(f"{m} arity")
+            snap += 1
+            size = 32 if ops[0].size == 32 else 16
+            if m == "vtestpd":
+                sign = "(((k) & 7u) == 7u ? 0x80 : 0)"
+            elif m == "vtestps":
+                sign = "(((k) & 3u) == 3u ? 0x80 : 0)"
+            else:
+                sign = "0xFF"      # `ptest` 是整字的与，没有符号位可挑
+            # `lane_ptr`, not `lane_at`: a byte-wise reader needs the lane's
+            # address, and `lane_at` is its value.
+            left = module.lane_ptr(ops[0], 0, insn)
+            right = module.lane_ptr(ops[1], 0, insn)
+            out.append(f"const uint8_t *lp{snap} = {left}, *rp{snap} = {right};")
+            out.append(f"uint64_t az{snap} = 0, cf{snap} = 0;")
+            out.append(f"for (unsigned k = 0; k < {size}u; k++) {{")
+            out.append(f"    const uint8_t mk = (uint8_t)({sign});")
+            out.append(f"    az{snap} |= (uint64_t)(lp{snap}[k] & rp{snap}[k] & mk);")
+            out.append(f"    cf{snap} |= (uint64_t)(rp{snap}[k] & (uint8_t)~lp{snap}[k] & mk);")
+            out.append("}")
+            pending = ("vtest", f"az{snap}", f"cf{snap}", 64)
+            continue
+        if m in ("rol", "ror"):
+            # 旋转写 CF 与 OF，保留 ZF/SF/PF/AF。所以夹一个旋转之后，相等与符号位
+            # 还是比较的，无符号条件与有符号序关系不再是——它们读的是旋转的进位与溢出。
+            if pending is not None and pending[0] in ("cmp", "test"):
+                pending = ("cmp_nocf",) + tuple(pending[1:])
+            elif pending is not None and pending[0] != "alu":
+                pending = None
+            out.extend(module.lift_one(insn))
             continue
         if m.startswith("j") and m != "jmp":
             if pending is None:
@@ -530,11 +630,16 @@ def lift_function(code, rva):
             if pending is None:
                 raise Refused(f"{m} without a compare")
             cond = condition(pending, suffix)
-            pending = None
             if m.startswith("set"):
+                # `setcc` writes a byte, not a flag: a second `setcc` reads the
+                # same comparison, and `cmp a,b / sete al / setb cl` is ordinary
+                # compiler output. Dropping `pending` here would refuse the
+                # second one, so it survives until something that really writes
+                # the flags runs.
                 out.append(module.wr(ops[0], f"({cond}) ? 1 : 0", insn))
-            else:
-                out.append(f"if ({cond}) {module.wr(ops[0], module.src(ops[1], insn), insn)}")
+                continue
+            pending = None
+            out.append(f"if ({cond}) {module.wr(ops[0], module.src(ops[1], insn), insn)}")
             continue
         if m in ("adc", "sbb", "rcl", "rcr", "bts", "btr", "btc"):
             raise Refused(m)

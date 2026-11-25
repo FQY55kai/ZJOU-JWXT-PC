@@ -291,7 +291,7 @@ VEC_BROADCAST = {
 # immediate's bit `n` picks src2's chunk `n` and drops src1's. Nothing here is a
 # float, which is why `blendps` is expressible without a float model: 32 bits in,
 # the same 32 bits out, from one side or the other.
-VEC_BLEND = {"blendps": 4, "blendpd": 8, "pblendw": 2, "vpblendd": 4}
+VEC_BLEND = {"blendps": 4, "blendpd": 8, "pblendw": 2, "pblendd": 4}
 
 # Packed compares. Each produces a mask of all-ones or all-zeros per chunk, so
 # the emitted statement per chunk is a select between two constants — no
@@ -372,12 +372,27 @@ VEC_SHIFT = {
 # eat the flags — no SSE or AVX instruction here writes EFLAGS, and the two that
 # do (`ucomiss`, `ptest`) are not in this set. Derived rather than retyped, so a
 # family added above is flag-neutral below without a second edit.
+# 按符号取反。第三个源的元素是符号：负则把第一个源的那个元素取反，零则清零，
+# 正则原样保留。数字是元素宽度。
+VEC_SIGN = {"psignb": 1, "psignw": 2, "psignd": 4}
+
+# 复制一半元素：`movshdup` 抄每个 128 位通道里的奇数元素，`movsldup` 抄偶数，
+# `movddup` 把低 64 位复制到高 64 位。全是 gather，用 `weave` 就够。
+VEC_DUP = {"movshdup": 1, "movsldup": 0}
+
+# 平方根。SSE 的 `sqrt` 是**正确舍入**的，IEEE 754 要求 `sqrt` 也正确舍入，
+# 所以 C 的 `sqrtf`/`sqrt` 与它是同一条指令——这一点与 `rsqrtps` 正相反。
+VEC_SQRT = {"sqrtps": (4, True), "sqrtpd": (8, True),
+            "sqrtss": (4, False), "sqrtsd": (8, False)}
+
 VEC_STEMS = (set(VEC_MOVE) | set(VEC_LOGIC) | set(VEC_FLOAT) | set(VEC_BROADCAST)
              | set(VEC_BLEND) | set(VEC_CMP_INT) | set(VEC_UNPACK)
              | set(VEC_INT_ARITH) | set(VEC_HADD) | set(VEC_SHIFT)
+             | set(VEC_SIGN) | set(VEC_DUP) | set(VEC_SQRT)
              | {"cmpps", "cmppd", "cmpss", "cmpsd", "shufps", "shufpd",
                 "shufss", "shufsd", "blendvps", "blendvpd", "pblendvb",
                 "pmovmskb", "movmskps", "movmskpd", "cvtsi2ss", "cvtsi2sd",
+                "insertps", "cvttss2si", "cvttsd2si", "movddup",
                 "movss", "movsd", "movd", "movq", "vzeroupper", "vzeroall"})
 
 
@@ -451,6 +466,20 @@ def lane_at(op, n, insn):
     return f"v[{index}][{n}]"
 
 
+def lane_ptr(op, n, insn):
+    """A pointer to 64-bit lane `n` of an operand — for byte-wise readers.
+
+    The plural of `lane_at`: that one is the lane's *value*, this one is where
+    it lives, which is what a loop over the bytes of a register file entry
+    needs. Casting the value to a pointer instead would make the register's
+    contents the address, and the first read would fault.
+    """
+    if op.type == capstone.x86.X86_OP_MEM:
+        return f"(const uint8_t *)(uintptr_t)({addr(op, insn)} + {8 * n})"
+    index, _ = vec(op)
+    return f"(const uint8_t *)&v[{index}][{n}]"
+
+
 def upper_zeroed(index):
     """The bits a VEX-encoded 128-bit form clears."""
     return [f"v[{index}][2] = 0;", f"v[{index}][3] = 0;"]
@@ -476,6 +505,12 @@ def float_operand(op, size, insn):
     if op.type == capstone.x86.X86_OP_MEM:
         return f"(*(const {ctype} *)(uintptr_t){addr(op, insn)})"
     return f"(*(const {ctype} *){lane(vec(op)[0])})"
+
+
+# Instructions that name their operand implicitly: the accumulator and rdx for
+# the sign-extension group. They have no `ops`, so the guard above has to let
+# them through to their own handler.
+ZERO_OPERAND = {"cdqe", "cdq", "cqo", "cbw", "cwde", "cwd", "leave", "lahf", "sahf"}
 
 
 def cmp_form(stem):
@@ -981,6 +1016,133 @@ def vec_line(insn):
         lines.append("}")
         return lines
 
+    if stem in VEC_SIGN:
+        chunk = VEC_SIGN[stem]
+        if len(ops) == 3:
+            dst, a, sign = ops
+        elif len(ops) == 2:
+            dst, a, sign = ops[0], ops[0], ops[1]
+        else:
+            raise Refused(f"{m} arity")
+        if not is_vec(dst):
+            raise Refused(f"{m} to memory")
+        index, width = vec(dst)
+        bits = chunk * 8
+        u, sg = f"uint{bits}_t", f"int{bits}_t"
+        lanes = width // chunk
+        lines = ["{"]
+        for n in range(lanes):
+            lines.append(f"    {sg} s{n} = {element(sign, n, sg, chunk, insn)};")
+            lines.append(f"    {u} v{n} = {element(a, n, u, chunk, insn)};")
+            # 负则取反（二补数下就是 0 - v），零则清零，正则原样。
+            lines.append(f"    {u} w{n} = (s{n} == 0) ? 0"
+                         f" : ((s{n} < 0) ? ({u})(0 - v{n}) : v{n});")
+        for n in range(lanes):
+            lines.append(f"    memcpy((char *){lane(index)} + {chunk * n}, &w{n}, {chunk});")
+        if width == 16 and vex:
+            lines += ["    " + z for z in upper_zeroed(index)]
+        lines.append("}")
+        return lines
+
+    if stem in VEC_DUP or stem == "movddup":
+        chunk = 8 if stem == "movddup" else 4
+        if len(ops) != 2:
+            raise Refused(f"{m} arity")
+        dst, source = ops
+        # `vmovddup xmm1, m64` is a legal form and the one this image uses: the
+        # 64 bits come from memory, so the source is not a register. `element`
+        # reads either kind, so the only thing to refuse is a destination that
+        # is not a register.
+        if not is_vec(dst) or not (is_vec(source)
+                                   or source.type == capstone.x86.X86_OP_MEM):
+            raise Refused(f"{m} form")
+        index, width = vec(dst)
+        per_lane = 16 // chunk
+        picks = []
+        for base in range(0, width // chunk, per_lane):
+            if stem == "movddup":
+                picks += [(source, base), (source, base)]
+            else:
+                for pair in range(per_lane // 2):
+                    at = base + 2 * pair + VEC_DUP[stem]
+                    picks += [(source, at), (source, at)]
+        return weave(index, width, chunk, picks, insn, vex)
+
+    if stem == "insertps":
+        # imm[7:6] 选 src2 的哪个元素，imm[5:4] 选它落在哪，imm[3:0] 是最后要清零的位掩码。
+        if len(ops) == 4:
+            dst, a, source, sel = ops
+        elif len(ops) == 3:
+            dst, a, source, sel = ops[0], ops[0], ops[1], ops[2]
+        else:
+            raise Refused(f"{m} arity")
+        if sel.type != capstone.x86.X86_OP_IMM:
+            raise Refused(f"{m} without an immediate")
+        if not is_vec(dst) or not is_vec(a):
+            raise Refused(f"{m} form")
+        index, width = vec(dst)
+        src_at = (sel.imm >> 6) & 3
+        dst_at = (sel.imm >> 4) & 3
+        lines = ["{"]
+        for n in range(4):
+            lines.append(f"    uint32_t w{n} = {element(a, n, 'uint32_t', 4, insn)};")
+        lines.append(f"    w{dst_at} = {element(source, src_at, 'uint32_t', 4, insn)};")
+        for n in range(4):
+            if (sel.imm >> n) & 1:
+                lines.append(f"    w{n} = 0;")
+        for n in range(4):
+            lines.append(f"    memcpy((char *){lane(index)} + {4 * n}, &w{n}, 4);")
+        if width == 16 and vex:
+            lines += ["    " + z for z in upper_zeroed(index)]
+        lines.append("}")
+        return lines
+
+    if stem in ("cvttss2si", "cvttsd2si"):
+        # 向零截断。源是 NaN 或超出目标范围时结果是"整数不定值"（只有符号位），
+        # C 的强制转换在那里是未定义行为，所以边界写成显式比较。
+        if len(ops) != 2 or is_vec(ops[0]) or not is_vec(ops[1]):
+            raise Refused(f"{m} form")
+        step = 4 if stem == "cvttss2si" else 8
+        out_bits = ops[0].size * 8  # `width` the name is taken by the register width here
+        source = float_operand(ops[1], step, insn)
+        lines = ["{", f"    double x = (double)({source});"]
+        if out_bits == 32:
+            lines.append("    int64_t v = (x > -2147483649.0 && x < 2147483648.0)"
+                         " ? (int64_t)x : (int64_t)INT32_MIN;")
+        else:
+            lines.append("    int64_t v = (x < 9223372036854775808.0)"
+                         " ? (int64_t)x : INT64_MIN;")
+        lines.append(f"    {wr(ops[0], '((uint64_t)v)', insn)}")
+        lines.append("}")
+        return lines
+
+    if stem in VEC_SQRT:
+        step, packed = VEC_SQRT[stem]
+        ctype = "double" if step == 8 else "float"
+        if len(ops) == 3:
+            dst, a, source = ops
+        elif len(ops) == 2:
+            dst, a, source = ops[0], None, ops[1]
+        else:
+            raise Refused(f"{m} arity")
+        if not is_vec(dst):
+            raise Refused(f"{m} to memory")
+        index, width = vec(dst)
+        lanes = width // step if packed else 1
+        fn = "sqrt" if ctype == "double" else "sqrtf"
+        lines = ["{"]
+        for n in range(lanes):
+            lines.append(f"    {ctype} d{n} = {fn}({element(source, n, ctype, step, insn)});")
+        if a is not None and vec(a)[0] != index:
+            # 标量形式上半部分取自 src1，与 `movss` 的三操作数形式同一条规则。
+            lines.append(f"    memcpy({lane(index)}, {lane(vec(a)[0])}, {width});")
+        for n in range(lanes):
+            lines.append(f"    memcpy((char *){lane(index)} + {step * n}, &d{n}, {step});")
+        if width == 16 and vex:
+            lines += ["    " + z for z in upper_zeroed(index)]
+        lines.append("}")
+        return lines
+
     if stem in VEC_CMP_INT:
         chunk, rel = VEC_CMP_INT[stem]
         if len(ops) == 3:
@@ -1105,7 +1267,11 @@ def lift_one(insn):
     vector = vec_line(insn)
     if vector is not None:
         return vector
-    if not ops:
+    if not ops and m not in ZERO_OPERAND:
+        # Every handler below reads `ops[0]`, so an operand-less instruction has
+        # to name itself here to get past. `cdqe` and its four siblings are the
+        # ones that do: they name a register implicitly, which is why a guard on
+        # `ops` silently refused 331 of them.
         raise Refused(m)
     if m == "push":
         return ["r[4] -= 8;", f"*(uint64_t *)(uintptr_t)(r[4]) = {src(ops[0], insn)};"]
@@ -1198,6 +1364,20 @@ def lift_one(insn):
             expr = f"{value} >> {count}"
         else:
             expr = f"(int{bits}_t){value} >> {count}"
+        return [wr(ops[0], expr, insn)]
+    if m in ("rol", "ror"):
+        # 旋转：计数按目标宽度掩码，所以 `rol eax, 32` 是空操作。两侧拼起来，
+        # `(bits - c) & (bits - 1)` 在 c 为 0 时给出 0，于是两项都是原值、或起来还是原值。
+        if len(ops) != 2:
+            raise Refused(f"{m} arity")
+        bits = width(ops[0])
+        value = f"(uint{bits}_t)({src(ops[0], insn)})"
+        shift = f"(uint64_t)({src(ops[1], insn)} & {bits - 1}u)"
+        other = f"(({bits}u - {shift}) & {bits - 1}u)"
+        if m == "rol":
+            expr = f"(uint{bits}_t)(({value} << {shift}) | ({value} >> {other}))"
+        else:
+            expr = f"(uint{bits}_t)(({value} >> {shift}) | ({value} << {other}))"
         return [wr(ops[0], expr, insn)]
     if m in ("shlx", "shrx", "sarx"):
         # BMI2: the count is a third operand and is masked the same way, which
@@ -1845,7 +2025,8 @@ def main():
     work = tempfile.mkdtemp(prefix="lift-")
     csrc = os.path.join(work, "lifted.c")
     head = ("#include <stdint.h>\n#include <stdio.h>\n#include <string.h>\n"
-            "#include <intrin.h>\nstatic uint64_t v[16][4];\n" + "\n".join(HELPERS) + "\n")
+            "#include <math.h>\n#include <intrin.h>\n"
+            "static uint64_t v[16][4];\n" + "\n".join(HELPERS) + "\n")
     whole = head + "\n".join(image_loader(pe)) + "\n" + "\n".join(body) + "\n" + driver
     with open(csrc, "w", encoding="utf-8") as f:
         f.write(whole)

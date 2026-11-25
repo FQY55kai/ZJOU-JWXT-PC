@@ -25,6 +25,7 @@ bridge, an image address in a guest `call`) and the generated C reports exactly
 which slot that was, so the comparison can exclude it instead of guessing.
 
     python tools/diff.py --limit 400 --branches
+    python tools/diff.py --snippets --rounds 6     # one function per instruction
 """
 
 import argparse
@@ -122,12 +123,208 @@ def externals(kept):
     return out
 
 
+# --- instruction snippets ---------------------------------------------------
+#
+# A whole function is the right unit to prove *a function* right, and the wrong
+# unit to prove *an instruction* right: the functions that use `vpsignb` are
+# mostly functions that read a global the file leaves zero, so they fault on
+# both sides and the instruction is never compared. Sixty per cent of what this
+# round added would go unverified that way.
+#
+# So each instruction gets its own one-instruction function. The bytes are the
+# image's own, copied out of a real function, which means no assembler and no
+# hand-encoded operands: whatever the compiler chose is what gets tested. They
+# are written into a run of padding inside `.text` — in a *copy* of the image,
+# so both sides map the same patched file — followed by a `ret` and, when the
+# instruction only speaks through the flags, by four `setcc`s that turn them
+# into bits.
+#
+# The trailer writes r10b..r13b, which no snippet's operands name, and
+# `flags_for` checks that by disassembling the bytes it just built.
+FLAG_TRAILER = {
+    "cf": bytes.fromhex("410f92c2"),  # setb  r10b
+    "zf": bytes.fromhex("410f94c3"),  # sete  r11b
+    "sf": bytes.fromhex("410f98c4"),  # sets  r12b
+    "of": bytes.fromhex("410f90c5"),  # seto  r13b
+}
+
+# (mnemonic, which flags the result is read through). Empty flags means the
+# instruction's result lands in a register or memory and is compared directly.
+#
+# Only instructions this image actually contains: a name nobody uses costs a
+# full rescan of `.pdata` and proves nothing. `ptest`, `vpsignw`, `blsmsk` and
+# the `lock`-prefixed atomics are all absent from this title, so they are not
+# listed even though the lifter accepts them.
+SNIPPETS = [
+    # 向量族：这一轮新升举的，加上本来就是多操作数、值得单独试的
+    ("vpsignb", ""),
+    ("vinsertps", ""), ("vmovshdup", ""), ("vmovsldup", ""), ("vmovddup", ""),
+    ("vblendps", ""), ("vpblendd", ""), ("vpblendw", ""),
+    ("vcmpeqps", ""), ("vcmpltps", ""), ("vcmplepd", ""),
+    ("vpcmpgtb", ""), ("vpcmpgtw", ""),
+    ("vshufps", ""), ("vshufpd", ""), ("vunpcklps", ""), ("vpunpckhwd", ""),
+    ("vhaddps", ""), ("vhaddpd", ""),
+    ("vpmovmskb", ""), ("vmovmskps", ""), ("vmovmskpd", ""),
+    ("vpsrad", ""), ("vpslld", ""), ("vpsrlq", ""), ("vpsllw", ""),
+    ("vpsubb", ""), ("vpaddw", ""),
+    ("vsqrtps", ""), ("vsqrtss", ""), ("vsqrtsd", ""),
+    ("vcvttss2si", ""), ("vcvttsd2si", ""),
+    # 只通过标志说话的：结果不落在任何寄存器，四个 setcc 就是全部可观测输出
+    ("vtestps", ("cf", "zf")), ("vtestpd", ("cf", "zf")),
+    # 整数侧：BMI1 位提取与计数、旋转、以及比较本身（czso 会走到这一轮新加的
+    # js/jns 与 jo/jno 两条路径）
+    ("tzcnt", ""), ("lzcnt", ""), ("blsr", ""), ("blsi", ""),
+    ("rol", ""), ("ror", ""),
+    ("cmp", ("cf", "zf", "sf", "of")),
+]
+
+
+def snippet_code(flags):
+    """The trailer of a snippet: "setcc*; ret" — the instruction bytes come first."""
+    trailer = b"".join(FLAG_TRAILER[f] for f in flags)  # one setcc per flag
+    return trailer + b"\xc3"
+
+
+def padding(pe, need):
+    """The largest run of one repeated padding byte in `.text` no function owns.
+
+    A snippet has to live somewhere the original code never enters and that no
+    unwinder claims, or writing it there changes what another test sees. Gaps
+    between `.pdata` ranges are exactly that.
+    """
+    text = next((s for s in pe.sections if s.Name.rstrip(b"\0") == b".text"), None)
+    if text is None:
+        raise SystemExit("no .text")
+    entry = pe.OPTIONAL_HEADER.DATA_DIRECTORY[3]
+    raw = pe.get_data(entry.VirtualAddress, entry.Size)
+    spans = []
+    for at in range(0, len(raw) - 11, 12):
+        begin, end, _ = struct.unpack_from("<III", raw, at)
+        if begin and end > begin:
+            spans.append((begin, end))
+    spans.sort()
+    best, best_len = None, 0
+    at = text.VirtualAddress
+    limit = text.VirtualAddress + text.Misc_VirtualSize
+    for begin, end in spans + [(limit, limit)]:
+        if begin - at > best_len and at >= text.VirtualAddress:
+            best, best_len = at, begin - at
+        at = max(at, end)
+    if best is None or best_len < need:
+        raise SystemExit(f"no padding run of {need} bytes in .text (largest {best_len})")
+    return best
+
+
+def snippets(exe, work):
+    """One function per instruction, written into a patched copy of the image.
+
+    Returns (path to the patched copy, the listing, the names). The listing is
+    the same shape `pick` returns, so everything downstream — `emit`, the
+    driver, the comparison — runs unchanged: the only difference is how the
+    functions got there.
+    """
+    pe = pefile.PE(exe, fast_load=True)
+    branch.set_image(pe)
+    entry = pe.OPTIONAL_HEADER.DATA_DIRECTORY[3]
+    table = pe.get_data(entry.VirtualAddress, entry.Size)
+
+    # One real instance of each instruction, from anywhere in the image. A
+    # rip-relative memory operand is skipped: the displacement belongs to the
+    # function the bytes came from, and the snippet lives somewhere else, so it
+    # would address an unrelated place — sometimes mapped, sometimes not, and
+    # never the same place it meant. What the compiler chose is what gets
+    # tested: no assembler, and no hand-picked operands.
+    wanted = {name for name, _ in SNIPPETS}
+    found = {}
+    for at in range(0, len(table) - 11, 12):
+        begin, end, _ = struct.unpack_from("<III", table, at)
+        if not begin or end <= begin or end - begin > 4096:
+            continue
+        for insn in lift.MD.disasm(pe.get_data(begin, end - begin), begin):
+            if insn.mnemonic not in wanted or insn.mnemonic in found:
+                continue
+            if any(op.type == capstone.x86.X86_OP_MEM
+                   and op.mem.base and lift.MD.reg_name(op.mem.base) == "rip"
+                   for op in insn.operands):
+                continue
+            # The first instance is not always a testable one: `vcmpeqps
+            # xmm0, xmm0, [rsi + 0x3320]` reads past the arena, so the harness
+            # cannot give it a place to read. A later instance of the same
+            # instruction usually has a shorter displacement, so keep looking
+            # instead of settling for an instance that would fault on both
+            # sides and prove nothing.
+            if not reachable(bytes(insn.bytes), 0):
+                continue
+            found[insn.mnemonic] = bytes(insn.bytes)
+        if len(found) == len(wanted):
+            break
+
+    # Lift each one before choosing where it goes: `branch` can still refuse,
+    # and a refusal here is information — it says which instruction the round
+    # has *not* covered, which is the opposite of what a passing count says.
+    pieces, refused = [], []
+    for name, flags in SNIPPETS:
+        body = found.get(name)
+        if body is None:
+            refused.append((name, "not in the image"))
+            continue
+        code = body + snippet_code(flags)
+        # `branch.lift_function` gets exactly what the guest will execute, so the
+        # bytes are the specification on both sides. rva is only ever used to
+        # resolve rip-relative targets, and a snippet has none.
+        try:
+            lines = branch.lift_function(code, 0)
+        except (branch.Refused, lift.Refused) as why:
+            refused.append((name, str(why)))
+            continue
+        if not lines:
+            refused.append((name, "lifted to nothing"))
+            continue
+        pieces.append((name, code, lines))
+
+    # Sixteen-byte starts, packed: the run has to fit in a gap between two
+    # `.pdata` ranges, and gaps in a stripped `.text` are hundreds of bytes, not
+    # thousands. A ret is a full stop, so alignment is for readability only.
+    offsets, at = [], 0
+    for _, code, _ in pieces:
+        at = (at + 15) & ~15
+        offsets.append(at)
+        at += len(code)
+
+    slots = padding(pe, at)
+    image = bytearray(open(exe, "rb").read())
+    rows = []
+    for (name, code, lines), off in zip(pieces, offsets):
+        rva = slots + off
+        rows.append((rva, name, code, lines))
+
+    for rva, _, code, _ in rows:
+        for sec in pe.sections:
+            if sec.VirtualAddress <= rva and rva + len(code) <= \
+                    sec.VirtualAddress + sec.SizeOfRawData:
+                fo = rva - sec.VirtualAddress + sec.PointerToRawData
+                image[fo:fo + len(code)] = code
+                break
+        else:
+            raise SystemExit(f"{rva:#x} ({len(code)} bytes) is not in raw data")
+
+    path = os.path.join(work, "snippets.exe")
+    open(path, "wb").write(image)
+    for name, why in refused:
+        print(f"  {name:14s} skipped: {why}")
+    print(f"  {len(rows)} snippets in {at} bytes at {slots:#x}, "
+          f"image patched to {os.path.basename(path)}")
+    return path, [(rva, code, lines) for rva, _, code, lines in rows], \
+        {rva: name for rva, name, _, _ in rows}
+
+
+
 def emit(kept, path, pe):
     """The lifted functions, a bridge for everything else, and a driver."""
     outer = externals(kept)
     names = sorted({rva for rva, _, _ in kept} | outer)
     lines = ["#include <stdint.h>", "#include <stdio.h>", "#include <string.h>",
-             "#include <intrin.h>", "#include <setjmp.h>"]
+             "#include <math.h>", "#include <intrin.h>", "#include <setjmp.h>"]
     lines += lift.HELPERS
     lines += lift.image_loader(pe)
     lines += [
@@ -342,19 +539,34 @@ def read_port(path, count):
 
 
 def vector_state(rng):
-    """Entry state for xmm0-xmm15: sixteen registers of normal small floats.
+    """Entry state for xmm0-xmm15: four kinds of register, one per index mod 4.
 
     Not random bytes. A random 64-bit lane is a NaN or a denormal far more often
     than not, and denormals are where hardware and a compiled expression are
     most likely to differ for reasons that have nothing to do with the
-    translation. Every 32-bit half here is a float in [1, 2): a normal number,
-    distinct per lane, and cheap to make.
+    translation. Every lane here is a normal float in [1, 2), or its negation,
+    or zero.
+
+    The variety is the point: `vtestps` looks only at sign bits, `vpsignb` reads
+    the sign of each byte of its third operand, and `vrsqrtps`-shaped code cares
+    whether a lane is zero. Sixteen registers of +1.0 would make every one of
+    those flags constant and the comparison vacuous — it would agree for the
+    wrong reason.
     """
     words = []
-    for _ in range(VEC_BYTES // 8):
-        low = 0x3F800000 | rng.getrandbits(23)
-        high = 0x3F800000 | rng.getrandbits(23)
-        words.append(low | (high << 32))
+    for reg in range(16):
+        style = reg % 4                      # +, -, zero, mixed
+        for _ in range(4):
+            low = 0x3F800000 | rng.getrandbits(23)
+            high = 0x3F800000 | rng.getrandbits(23)
+            if style == 1:
+                low, high = low | 0x80000000, high | 0x80000000
+            elif style == 2:
+                low = high = 0
+            elif style == 3:
+                low |= rng.getrandbits(1) << 31
+                high |= rng.getrandbits(1) << 31
+            words.append(low | (high << 32))
     return words
 
 
@@ -388,15 +600,35 @@ def main():
     ap.add_argument("--bridge", default=r"D:\zjou-build\release\oracle_guest.dll",
                     help="the DLL that exports guest_bridge")
     ap.add_argument("--branches", action="store_true", help="use the branch pass")
+    ap.add_argument("--snippets", action="store_true",
+                    help="one function per instruction, bytes taken from the image")
     ap.add_argument("--keep", help="write the generated C here, for reading")
     args = ap.parse_args()
 
-    pe, picked = pick(args.exe, args.limit, args.max_bytes, args.branches, args.skip)
+    work = tempfile.mkdtemp(prefix="diff-")
+    names = {}
+    if args.snippets:
+        # Every instruction gets the function it appears in somewhere in the
+        # image, cut down to itself. `--limit` does not apply: the unit here is
+        # the instruction, not the function.
+        patched, picked, names = snippets(args.exe, work)
+        args.exe = patched
+    else:
+        _, picked = pick(args.exe, args.limit, args.max_bytes, args.branches, args.skip)
     kept = [(rva, code, lines) for rva, code, lines in picked
             if reachable(code, rva) and balanced(code, rva)]
+    if names:
+        gone = [names[rva] for rva, _, _ in picked if rva not in {k[0] for k in kept}]
+        if gone:
+            print(f"  not runnable as a snippet: {', '.join(gone)}")
     if args.only is not None:
         kept = [item for item in kept if item[0] == args.only]
         args.rounds = 1
+    # Both sides map `args.exe`, so a snippet run patches a copy and both sides
+    # see the same file: the bytes are the specification, and there is no way
+    # for the oracle to test something other than what the port executes.
+    pe = pefile.PE(args.exe, fast_load=True)
+    branch.set_image(pe)
     bridged = len(externals(kept))
     print(f"lifted {len(picked)} functions, {len(kept)} runnable here, {bridged} bridged callee(s)")
     lifted = {rva: code for rva, code, _ in kept}
@@ -405,7 +637,6 @@ def main():
         print(f"  {len(teb)} of them read the TEB, here or through a callee: "
               f"compared apart, since the two processes have different TEBs")
 
-    work = tempfile.mkdtemp(prefix="diff-")
     csrc = os.path.join(work, "lifted.c")
     emit(kept, csrc, pe)
     if args.keep:
@@ -464,6 +695,7 @@ def main():
         live = [rva for rva in live if rva not in faulted_both and rva not in faulted_port]
 
     bad, checked, shown, apart = 0, 0, 0, 0
+    per_name = {}
     for rva, want, mine in records:
         if want is None or mine is None or not mine["ran"]:
             continue
@@ -480,7 +712,12 @@ def main():
         checked += 1
         same_memory = all(got_arena[off:off + 8] == want[1][off:off + 8]
                           for off in range(0, ARENA_SIZE, 8) if off not in skip)
-        if list(got_regs) != list(want[0]) or not same_memory or got_vec != want[2]:
+        agree = list(got_regs) == list(want[0]) and same_memory and got_vec == want[2]
+        if names:
+            name = names[rva]
+            ok, n = per_name.get(name, (0, 0))
+            per_name[name] = (ok + (1 if agree else 0), n + 1)
+        if not agree:
             bad += 1
             if shown < 6:
                 shown += 1
@@ -498,7 +735,17 @@ def main():
                 print(f"  {rva:#x}: " + ", ".join(clash))
     print(f"functions: {len(kept)} runnable, {len(kept) - len(faulted_both) - len(faulted_port)} "
           f"compared, {len(faulted_both)} fault in both, {len(faulted_port)} fault only in the port")
+    if names and faulted_port:
+        print("  faulting only in the port: "
+              + ", ".join(sorted(names[r] for r in faulted_port)))
     print(f"against hardware: {checked} case(s) compared, {checked - bad} agree, {bad} differ")
+    if per_name:
+        broken = sorted(n for n, (ok, tot) in per_name.items() if ok != tot)
+        clean = sorted(n for n, (ok, tot) in per_name.items() if ok == tot)
+        print(f"  {len(per_name)} instruction(s) covered, {len(clean)} of them agree on every case")
+        if broken:
+            print("  disagreeing: " + ", ".join(
+                f"{n} ({per_name[n][0]}/{per_name[n][1]})" for n in broken))
     if apart:
         print(f"  {apart} further case(s) not compared: the TEB is per process, "
               f"so the two sides cannot see the same TLS")
