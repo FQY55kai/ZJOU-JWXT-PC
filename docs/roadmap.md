@@ -42,6 +42,9 @@
 ## M2 —— 分支与标志（3–6 周）
 
 - [x] 基本块 + CFG + 标签/`goto`（`tools/branch.py`，只做 cmp/test + jcc 窥孔）
+- [ ] 标志位按"生产者→消费者、无入边直线段"建模（照 X2W 的规则，见 `docs/reference-xbox2windows.md`）
+- [ ] `setcc`/`cmovcc` 作为消费者；8/16 位窄算术的 OF/PF 按操作数宽度判
+- [ ] 跳转表两种模式 → `switch`（`B` 同址、索引可证）
 - [ ] 条件跳转映射
 - [ ] 标志位活跃性分析（只算被读的）
 - [ ] `setcc` / `cmovcc` / `adc` / `sbb` / 多精度运算
