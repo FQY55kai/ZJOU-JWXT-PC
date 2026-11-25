@@ -18,6 +18,7 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import branch  # noqa: E402
 import capstone  # noqa: E402
 import lift  # noqa: E402
 
@@ -80,6 +81,30 @@ def safe(code, rva):
     return True
 
 
+def candidates_branch(exe, limit, max_bytes):
+    """Functions lifted with the branch pass, in `.pdata` order."""
+    import pefile
+
+    pe = pefile.PE(exe, fast_load=True)
+    entry = pe.OPTIONAL_HEADER.DATA_DIRECTORY[3]
+    table = pe.get_data(entry.VirtualAddress, entry.Size)
+    picked = []
+    for at in range(0, len(table) - 11, 12):
+        begin, end, _ = struct.unpack_from("<III", table, at)
+        if begin == 0 or not 0 < end - begin <= max_bytes:
+            continue
+        code = pe.get_data(begin, end - begin)
+        try:
+            lines = branch.lift_function(code, begin)
+        except (branch.Refused, lift.Refused):
+            continue
+        if lines:
+            picked.append((begin, code, lines))
+        if len(picked) >= limit:
+            break
+    return pe, picked
+
+
 def emit(picked, path):
     """The lifted functions plus a driver: reads cases, writes results."""
     out = ["#include <stdint.h>", "#include <stdio.h>", "#include <string.h>"]
@@ -118,11 +143,16 @@ def main():
     ap.add_argument("--max-bytes", type=int, default=220)
     ap.add_argument("--rounds", type=int, default=4)
     ap.add_argument("--oracle", default=r"D:\zjou-build\release\oracle.exe")
+    ap.add_argument("--branches", action="store_true", help="use the branch pass")
     args = ap.parse_args()
 
-    pe, picked = lift.candidates(args.exe, args.limit, args.max_bytes)
-    kept = [(rva, code, lines) for rva, code, lines in picked if safe(code, rva) and balanced(code, rva)]
-    print(f"lifted {len(picked)} functions, {len(kept)} safe and balanced to run natively")
+    if args.branches:
+        pe, picked = candidates_branch(args.exe, args.limit, args.max_bytes)
+        kept = [(rva, code, lines) for rva, code, lines in picked if safe(code, rva) and balanced(code, rva)]
+    else:
+        pe, picked = lift.candidates(args.exe, args.limit, args.max_bytes)
+        kept = [(rva, code, lines) for rva, code, lines in picked if safe(code, rva) and balanced(code, rva)]
+    print(f"lifted {len(picked)} functions, {len(kept)} runnable here")
 
     work = tempfile.mkdtemp(prefix="diff-")
     csrc = os.path.join(work, "lifted.c")

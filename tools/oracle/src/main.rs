@@ -169,6 +169,42 @@ fn rva_to_offset(image: &[u8], rva: usize) -> Option<usize> {
     None
 }
 
+/// Maps the image at the base it asks for, section by section.
+///
+/// A function copied to an arbitrary page is only runnable if it never touches
+/// its own image: every `mov rax, [rip+N]` would resolve against the wrong
+/// base. Mapping the image where it wants to be makes those reads land on the
+/// bytes the compiler meant, which is most of what a real function does.
+fn map_image(image: &[u8]) -> (*mut u8, usize) {
+    let at = u32::from_le_bytes(image[0x3c..0x40].try_into().unwrap()) as usize;
+    let sections = u16::from_le_bytes(image[at + 6..at + 8].try_into().unwrap()) as usize;
+    let optional = u16::from_le_bytes(image[at + 20..at + 22].try_into().unwrap()) as usize;
+    let opt = at + 24;
+    let base = u64::from_le_bytes(image[opt + 24..opt + 32].try_into().unwrap()) as usize;
+    let size = u32::from_le_bytes(image[opt + 56..opt + 60].try_into().unwrap()) as usize;
+    unsafe {
+        let got = VirtualAlloc(base as *const c_void, size, 0x3000, 0x40) as usize;
+        assert_eq!(got, base, "the image's base is taken ({got:#x})");
+        let table = opt + optional;
+        for i in 0..sections {
+            let e = &image[table + i * 40..table + i * 40 + 40];
+            let virtual_size = u32::from_le_bytes(e[8..12].try_into().unwrap()) as usize;
+            let virtual_address = u32::from_le_bytes(e[12..16].try_into().unwrap()) as usize;
+            let raw_size = u32::from_le_bytes(e[16..20].try_into().unwrap()) as usize;
+            let raw_pointer = u32::from_le_bytes(e[20..24].try_into().unwrap()) as usize;
+            let n = raw_size.min(virtual_size.max(raw_size));
+            if raw_pointer + n <= image.len() && virtual_address + n <= size {
+                std::ptr::copy_nonoverlapping(
+                    image.as_ptr().add(raw_pointer),
+                    (base + virtual_address) as *mut u8,
+                    n,
+                );
+            }
+        }
+        (base as *mut u8, size)
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).is_some_and(|a| a == "--selftest") {
@@ -187,10 +223,7 @@ fn main() {
         .expect("cases");
     let mut out = Vec::with_capacity(cases.len());
 
-    // One executable page, reused: each case's bytes are copied in, called,
-    // and the page is left as it was.
-    let page = unsafe { VirtualAlloc(std::ptr::null(), PAGE, 0x3000, 0x40) };
-    assert!(!page.is_null(), "VirtualAlloc");
+    let (mapped, image_size) = map_image(&image);
 
     let mut at = 0usize;
     let mut ran = 0u32;
@@ -206,8 +239,7 @@ fn main() {
         let stack = &cases[at..at + 256];
         at += 256;
 
-        let offset = rva_to_offset(&image, rva);
-        if len == 0 || len > PAGE || offset.is_none() || offset.unwrap() + len > image.len() {
+        if len == 0 || rva + len > image_size {
             out.extend_from_slice(&regs.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>());
             out.extend_from_slice(stack);
             continue;
@@ -217,13 +249,12 @@ fn main() {
             // Bytes go in at the page's start; RIP-relative operands would
             // resolve against the wrong base, which is why the caller filters
             // them out before sending a case here.
-            std::ptr::copy_nonoverlapping(image.as_ptr().add(offset.unwrap()), page as *mut u8, len);
             let mut ours = regs;
             let mut stk = Aligned([0u8; 256]);
             stk.0.copy_from_slice(stack);
             REGS = ours.as_mut_ptr();
             STK = stk.0.as_mut_ptr();
-            CODE = page as *const u8;
+            CODE = (mapped as usize + rva) as *const u8;
             call_guest();
             let mut back = [0u64; 16];
             back.copy_from_slice(&OUT);
@@ -236,7 +267,7 @@ fn main() {
             ran += 1;
         }
     }
-    unsafe { VirtualFree(page, 0, 0x8000) };
+    unsafe { VirtualFree(mapped as *mut c_void, 0, 0x8000) };
     std::fs::File::create(&args[3])
         .expect("out")
         .write_all(&out)
