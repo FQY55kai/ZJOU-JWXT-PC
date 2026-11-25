@@ -28,8 +28,32 @@ the guard compared:
     movsxd E,[B+I*4];       add E,B; jmp E   B = table
 
 The dispatch becomes a `switch` over the table's targets. Everything else is
-refused: `adc`/`sbb`, a call or jump whose target is not an immediate, a `jcc`
-whose flags were written further back.
+refused: `adc`/`sbb`, a `jcc` whose flags were written further back.
+
+A call or a jump whose target is not an immediate is not refused, because the
+target is a value and a value can be looked up. `call rax`, `call [rcx+0x18]`,
+`jmp [rip+IAT]` and a tail call through a vtable slot all become the same shape
+— read the operand, hand it to a dispatch that knows the function table — and
+the indirect `jmp` shapes above are tried first, so a recognised jump table is
+still a `switch` rather than a lookup. The site becomes
+
+    uint64_t t = <the operand, read before the push>;
+    *(uint64_t *)(uintptr_t)(r[4] - 8) = (uint64_t)(img + <return>);
+    r[4] -= 8;
+    call_indirect(r, t);
+    r[4] += 8;
+
+and the translation unit owes this module two hooks:
+
+    void call_indirect(uint64_t *r, uint64_t target);
+    void jump_indirect(uint64_t *r, uint64_t target);
+
+The contract is the same for both: `target` is an address in the guest's own
+space, `r` is the register file, the return address (for `call_indirect`) has
+already been pushed and `r[4]` already lowered. The hook routes to the lifted
+body if this unit has one at that address and otherwise runs the original bytes
+there — which is not a fallback in the sense of being worse, it is the same code
+the console ran.
 """
 
 import capstone
@@ -47,7 +71,7 @@ EQUALITY = {"e": "==", "ne": "!="}
 # carry and signed overflow, not the comparison the condition names — so only
 # e/ne/s/ns may read these.
 FLAG_FROM_RESULT = {"add", "sub", "and", "or", "xor", "inc", "dec", "neg",
-                    "andn", "bextr"}
+                    "andn", "bextr", "xadd", "blsi", "blsmsk", "blsr"}
 
 # The vector unit's moves and bitwise ops. None of them write the arithmetic
 # flags — the ones that do (`ucomiss`, `ptest`) are not translated at all — so a
@@ -61,11 +85,19 @@ VEC_FLAGLESS = {
     "vzeroupper", "vzeroall",
 }
 
+# ... and the same for every other vector stem this lifter knows. Built from
+# `lift`'s tables rather than written out again, so a family added there is
+# flag-neutral here without a second edit — which is the kind of omission that
+# refuses a function for a reason that has nothing to do with the instruction
+# that actually stopped it.
+FLAGLESS_STEMS = VEC_FLAGLESS | module.VEC_STEMS
+
 
 def flag_neutral(mnemonic):
     """True when the instruction leaves the arithmetic flags alone."""
-    return mnemonic in VEC_FLAGLESS or (
-        mnemonic.startswith("v") and mnemonic[1:] in VEC_FLAGLESS)
+    stem = mnemonic[1:] if mnemonic.startswith("v") else mnemonic
+    return stem in FLAGLESS_STEMS or module.cmp_form(stem) is not None
+
 
 # Instructions that leave the flags alone, so a compare stays live across them.
 # Everything else that is not a consumer invalidates it: a `cmp` followed by an
@@ -186,7 +218,15 @@ def condition(pending, suffix):
             return f"!{unordered}"
         raise Refused(f"float compare {suffix}")
     if suffix in EQUALITY:
-        return f"(({a}) {EQUALITY[suffix]} ({b}))"
+        # The same truncation as the ordering conditions below, and for the same
+        # reason. `cmp eax, -1` compares 0xFFFFFFFF against 0xFFFFFFFF and finds
+        # them equal; comparing the 64-bit snapshots would compare
+        # 0x00000000FFFFFFFF against 0xFFFFFFFFFFFFFFFF and find them different.
+        # Found by the harness on `0x7c62b0`, a function whose whole job is
+        # `cmp eax, -1; setne al`, and it is the same one-off signature as
+        # `0x272070` from the previous round — one bug, two functions, and
+        # neither the interpreter nor the emitter could see it.
+        return f"((uint{bits}_t)({a}) {EQUALITY[suffix]} (uint{bits}_t)({b}))"
     if suffix in UNSIGNED:
         # Both sides are truncated to the operand's width first. The snapshots
         # are 64-bit, and an immediate arrives sign-extended to 64 bits, so
@@ -306,9 +346,15 @@ def walk(code, rva):
             m = insn.mnemonic
             nxt = at + insn.size
             if m == "call":
-                if not insn.operands or insn.operands[0].type != capstone.x86.X86_OP_IMM:
-                    raise Refused("indirect call")
-                calls.add(insn.operands[0].imm)
+                if not insn.operands:
+                    raise Refused("call without an operand")
+                # `call rax` / `call [rcx+0x18]` names no target at translate
+                # time: it is a value. It is not refused — the site is emitted
+                # as `call_indirect` and resolved against the dispatch at run
+                # time — but it adds no edge to `calls`, so nothing static here
+                # can see what it reaches.
+                if insn.operands[0].type == capstone.x86.X86_OP_IMM:
+                    calls.add(insn.operands[0].imm)
             elif m in ("ret", "retf"):
                 break
             elif m == "jmp":
@@ -323,7 +369,13 @@ def walk(code, rva):
                     break
                 table = _dispatch(recent, insn, rva, end)
                 if table is None:
-                    raise Refused("indirect branch")
+                    # Not one of the two dispatch shapes — an import thunk
+                    # (`jmp [rip+IAT]`) or a tail call through a vtable slot.
+                    # The target is a value, so it is resolved at run time the
+                    # same way an indirect call is, and the two entries of the
+                    # function table are known here even if the one this jump
+                    # takes is not.
+                    break
                 dispatches[at] = table
                 for case in table["entries"]:
                     if rva <= case < end:
@@ -367,6 +419,12 @@ def lift_function(code, rva):
             pending = None
             out.append(f"L{at:#x}: ;")
         m, ops = insn.mnemonic, insn.operands
+        if m.startswith("lock "):
+            # Capstone names the locked forms by the whole instruction. The
+            # prefix is atomicity against another core, which this port does not
+            # have, so the body is the inner instruction's — but the *flags* are
+            # the inner instruction's too, and `jz` after `lock dec` reads them.
+            m = m[5:]
         if at in dispatches:
             table = dispatches[at]
             snap += 1
@@ -379,6 +437,32 @@ def lift_function(code, rva):
             # do here anyway, without running off the end of the switch.
             out.append("default: return;")
             out.append("}")
+            continue
+        if m == "cmpxchg":
+            # The comparison is the destination against rax, taken before the
+            # store, and ZF *is* its equality — so a `jne` after `lock cmpxchg`
+            # is a `jne` on `dest - rax`, which is exactly what a `cmp` would
+            # have left behind. The store then depends on the same comparison
+            # the other way round: equal writes the source, unequal writes the
+            # old value into rax.
+            if len(ops) != 2:
+                raise Refused("cmpxchg arity")
+            bits = module.width(ops[0])
+            wide = f"uint{bits}_t"
+            snap += 1
+            out.append(f"{wide} o{snap} = {module.src(ops[0], insn)};")
+            out.append(f"{wide} v{snap} = {module.src(ops[1], insn)};")
+            out.append(f"{wide} x{snap} = (uint{bits}_t)r[0];")
+            if bits == 64:
+                back = f"r[0] = (uint64_t)o{snap};"
+            elif bits == 32:
+                back = f"r[0] = (uint64_t)(uint32_t)o{snap};"
+            else:
+                mask = module.ONES[bits]
+                back = f"r[0] = (r[0] & ~{mask}) | ((uint64_t)o{snap} & {mask});"
+            out.append(f"if (x{snap} == o{snap}) {module.wr(ops[0], f'v{snap}', insn)}"
+                       f" else {back}")
+            pending = ("cmp", f"o{snap}", f"x{snap}", bits)
             continue
         if m in ("cmp", "test"):
             snap += 1
@@ -407,6 +491,18 @@ def lift_function(code, rva):
             out.append(f"if ({cond}) goto L{ops[0].imm:#x};")
             continue
         if m == "jmp":
+            if ops[0].type != capstone.x86.X86_OP_IMM:
+                # `jmp rax` / `jmp [rax]`: a tail call whose target is a value.
+                # Read it before anything else writes a register, then hand it
+                # to the dispatch — which is the same shape as a lifted `j_`,
+                # with the original bytes as the fallback. `rsp` already holds
+                # the caller's return address, so there is nothing to push and
+                # the callee's `ret` leaves for *our* caller.
+                snap += 1
+                out.append(f"uint64_t t{snap} = {module.src(ops[0], insn)};")
+                out.append(f"jump_indirect(r, t{snap});")
+                out.append("return;")
+                continue
             target = ops[0].imm
             if start <= target < end:
                 out.append(f"goto L{target:#x};")
@@ -448,6 +544,22 @@ def lift_function(code, rva):
             # builds sits eight bytes off and the stack it leaves behind is not
             # the stack the original left behind.
             ret = at + insn.size
+            if ops[0].type != capstone.x86.X86_OP_IMM:
+                # The target is a value, so it has to be read before the push:
+                # `call qword ptr [rsp+0x28]` reads the slot *above* the return
+                # address it is about to write, and the hardware computes the
+                # operand before it writes anything. `t` is that value, and
+                # `call_indirect` is the dispatch — the same table a lifted
+                # `f_` would be reached through, with the original bytes as the
+                # fallback for a target the unit does not know.
+                snap += 1
+                out.append(f"uint64_t t{snap} = {module.src(ops[0], insn)};")
+                out.append(f"*(uint64_t *)(uintptr_t)(r[4] - 8) = (uint64_t)(img + {ret:#x});")
+                out.append("r[4] -= 8;")
+                out.append(f"call_indirect(r, t{snap});")
+                out.append("r[4] += 8;")
+                pending = None
+                continue
             out.append(f"*(uint64_t *)(uintptr_t)(r[4] - 8) = (uint64_t)(img + {ret:#x});")
             out.append("r[4] -= 8;")
             out.append(f"f_{ops[0].imm:#x}(r);")

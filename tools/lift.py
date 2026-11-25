@@ -287,6 +287,143 @@ VEC_BROADCAST = {
     "pbroadcastd": 4, "pbroadcastq": 8,
 }
 
+# Blends: a bitwise select per chunk, and the chunk is the whole story — the
+# immediate's bit `n` picks src2's chunk `n` and drops src1's. Nothing here is a
+# float, which is why `blendps` is expressible without a float model: 32 bits in,
+# the same 32 bits out, from one side or the other.
+VEC_BLEND = {"blendps": 4, "blendpd": 8, "pblendw": 2, "vpblendd": 4}
+
+# Packed compares. Each produces a mask of all-ones or all-zeros per chunk, so
+# the emitted statement per chunk is a select between two constants — no
+# comparison result reaches a register as a bool.
+#
+# The signedness is the instruction's, not C's: `pcmpgtb` is signed, and there
+# is no unsigned form of the packed byte compare at all (the idiom for it is an
+# xor with 0x80 first, which the title does itself).
+VEC_CMP_INT = {
+    "pcmpeqb": (1, "=="), "pcmpeqw": (2, "=="),
+    "pcmpeqd": (4, "=="), "pcmpeqq": (8, "=="),
+    "pcmpgtb": (1, ">"), "pcmpgtw": (2, ">"),
+    "pcmpgtd": (4, ">"), "pcmpgtq": (8, ">"),
+}
+
+# The immediate predicate of `cmpps`/`cmppd`/`cmpss`/`cmpsd`, as the C relation
+# that decides "all ones". Every one of the eight is written so that a NaN on
+# either side lands on the side the instruction puts it: `eq` and `lt` and `le`
+# are *ordered* and false for NaN, which C's `==`, `<`, `<=` already are; `neq`,
+# `nlt` and `nle` are *unordered* and true for NaN, which the negation of those
+# already is; `unord` and `ord` are the two predicates that name NaN directly.
+VEC_CMP_FLOAT = {
+    0: "{a} == {b}", 1: "{a} < {b}", 2: "{a} <= {b}",
+    3: "!({a} == {a}) || !({b} == {b})", 4: "!({a} == {b})",
+    5: "!({a} < {b})", 6: "!({a} <= {b})",
+    7: "({a} == {a}) && ({b} == {b})",
+}
+
+# Capstone names `cmpps` by the predicate it was given — `vcmpeqps`,
+# `vcmpltss` — and then does not report the immediate, so the predicate has to
+# be read back out of the mnemonic. The eight names are the eight encodings.
+CMP_PREDICATE = {
+    "eq": 0, "lt": 1, "le": 2, "unord": 3,
+    "neq": 4, "nlt": 5, "nle": 6, "ord": 7,
+}
+
+# Shuffles and interleaves are all one shape: a list of which chunk of which
+# source ends up at each output chunk. So they are all one emitter — build the
+# list, read every chunk, then write. `unpck*` is the interleave of the low or
+# high half of each 128-bit lane, which is why the second number is the half.
+VEC_UNPACK = {
+    "unpcklps": (4, 0), "unpckhps": (4, 1),
+    "unpcklpd": (8, 0), "unpckhpd": (8, 1),
+    "punpcklbw": (1, 0), "punpckhbw": (1, 1),
+    "punpcklwd": (2, 0), "punpckhwd": (2, 1),
+    "punpckldq": (4, 0), "punpckhdq": (4, 1),
+    "punpcklqdq": (8, 0), "punpckhqdq": (8, 1),
+}
+
+# Packed integer add and subtract: chunk-local, wrapping, and signedness-free
+# because two's complement does not care.
+VEC_INT_ARITH = {}
+for _op, _sym in (("add", "+"), ("sub", "-")):
+    for _sz, _ch in (("b", 1), ("w", 2), ("d", 4), ("q", 8)):
+        VEC_INT_ARITH[f"p{_op}{_sz}"] = (_ch, _sym)
+del _op, _sym, _sz, _ch
+
+# Horizontal add. Per 128-bit lane the pairs collapse inside one source and then
+# inside the other: `haddps` gives a0+a1, a2+a3, b0+b1, b2+b3, and `haddpd`
+# alternates, a0+a1, b0+b1 — which is the same rule with two lanes instead of
+# four. The upper lane of a 256-bit register repeats it rather than mixing.
+VEC_HADD = {"haddps": 4, "haddpd": 8, "haddss": 0, "haddsd": 0}
+
+# Packed shifts. The second number is the chunk, and the third says whether the
+# shift fills with the sign bit — which is why `psrad` is not `psrld` with a
+# different width. The count is the low 64 bits of a second operand (or an
+# immediate), and a count past the chunk's width saturates: all sign bits for an
+# arithmetic shift, all zeros for a logical one.
+VEC_SHIFT = {
+    "psllw": (2, "<<"), "pslld": (4, "<<"), "psllq": (8, "<<"),
+    "psrlw": (2, ">>"), "psrld": (4, ">>"), "psrlq": (8, ">>"),
+    "psraw": (2, "SAR"), "psrad": (4, "SAR"),
+}
+
+
+# Every vector instruction this lifter translates, by stem. `branch.py` needs
+# this to know that a vector instruction between a `cmp` and its branch did not
+# eat the flags — no SSE or AVX instruction here writes EFLAGS, and the two that
+# do (`ucomiss`, `ptest`) are not in this set. Derived rather than retyped, so a
+# family added above is flag-neutral below without a second edit.
+VEC_STEMS = (set(VEC_MOVE) | set(VEC_LOGIC) | set(VEC_FLOAT) | set(VEC_BROADCAST)
+             | set(VEC_BLEND) | set(VEC_CMP_INT) | set(VEC_UNPACK)
+             | set(VEC_INT_ARITH) | set(VEC_HADD) | set(VEC_SHIFT)
+             | {"cmpps", "cmppd", "cmpss", "cmpsd", "shufps", "shufpd",
+                "shufss", "shufsd", "blendvps", "blendvpd", "pblendvb",
+                "pmovmskb", "movmskps", "movmskpd", "cvtsi2ss", "cvtsi2sd",
+                "movss", "movsd", "movd", "movq", "vzeroupper", "vzeroall"})
+
+
+
+# C the emitted code leans on, kept in one place because two programs compile
+# that code: this module's own check and the differential harness. A helper
+# defined in only one of them is a link error in the other, found late.
+HELPERS = [
+    "// `tzcnt` and `lzcnt` are defined at zero — the count is the operand's",
+    "// width — which `bsf`/`bsr` are not, so the intrinsic's failure return is",
+    "// part of the answer rather than a case to refuse.",
+    "static uint64_t count_trailing(uint64_t x, unsigned bits) {",
+    "    unsigned long i;",
+    "    if (x == 0) return bits;",
+    "    _BitScanForward64(&i, x);",
+    "    return i;",
+    "}",
+    "static uint64_t count_leading(uint64_t x, unsigned bits) {",
+    "    unsigned long i;",
+    "    if (x == 0) return bits;",
+    "    _BitScanReverse64(&i, x);",
+    "    return bits - 1 - i;",
+    "}",
+]
+
+
+def weave(index, width, chunk, picks, insn, vex):
+    """Copy chunk `picks[n]` of its source (`op`, chunk number) to chunk `n`.
+
+    Every read is hoisted into a local before any write. The destination is
+    almost always one of the sources — `vblendps xmm0, xmm0, xmm1, 8` — and a
+    per-chunk copy would overwrite a chunk a later one still has to read.
+    """
+    bits = chunk * 8
+    lines = ["{"]
+    for n, (op, k) in enumerate(picks):
+        lines.append(f"    uint{bits}_t w{n} = "
+                     f"{element(op, k, f'uint{bits}_t', chunk, insn)};")
+    for n in range(len(picks)):
+        lines.append(f"    memcpy((char *){lane(index)} + {chunk * n}, &w{n}, {chunk});")
+    if width == 16 and vex:
+        lines += ["    " + z for z in upper_zeroed(index)]
+    lines.append("}")
+    return lines
+
+
 
 def vec(op):
     """(index, bytes) for a vector register operand."""
@@ -339,6 +476,23 @@ def float_operand(op, size, insn):
     if op.type == capstone.x86.X86_OP_MEM:
         return f"(*(const {ctype} *)(uintptr_t){addr(op, insn)})"
     return f"(*(const {ctype} *){lane(vec(op)[0])})"
+
+
+def cmp_form(stem):
+    """(predicate, packed, ctype) for a compare named by its predicate, or None.
+
+    `cmpps xmm0, xmm1, 3` carries the predicate as an immediate and capstone
+    reports it that way; `vcmpeqps` is the same instruction with the predicate
+    folded into the name and the immediate no longer reported at all. Both have
+    to reach the same place, so the name is read back apart.
+    """
+    if not stem.startswith("cmp"):
+        return None
+    for tail in ("ps", "pd", "ss", "sd"):
+        if stem.endswith(tail) and stem[3:-2] in CMP_PREDICATE:
+            ctype = "double" if tail in ("pd", "sd") else "float"
+            return CMP_PREDICATE[stem[3:-2]], tail in ("ps", "pd"), ctype
+    return None
 
 
 def vec_line(insn):
@@ -512,6 +666,398 @@ def vec_line(insn):
         lines.append("}")
         return lines
 
+    if stem in VEC_BLEND:
+        chunk = VEC_BLEND[stem]
+        if len(ops) == 4:
+            dst, a, b, sel = ops
+        elif len(ops) == 3:
+            dst, a, b, sel = ops[0], ops[0], ops[1], ops[2]
+        else:
+            raise Refused(f"{m} arity")
+        if sel.type != capstone.x86.X86_OP_IMM:
+            raise Refused(f"{m} without an immediate mask")
+        if not is_vec(dst):
+            raise Refused(f"{m} to memory")
+        index, width = vec(dst)
+        lanes = width // chunk
+        picks = [(b if (sel.imm >> n) & 1 else a, n) for n in range(lanes)]
+        return weave(index, width, chunk, picks, insn, vex)
+
+    if stem in VEC_INT_ARITH:
+        chunk, sym = VEC_INT_ARITH[stem]
+        if len(ops) == 3:
+            dst, a, b = ops
+        elif len(ops) == 2:
+            dst, a, b = ops[0], ops[0], ops[1]
+        else:
+            raise Refused(f"{m} arity")
+        if not is_vec(dst):
+            raise Refused(f"{m} to memory")
+        index, width = vec(dst)
+        bits = chunk * 8
+        lanes = width // chunk
+        unsigned = f"uint{bits}_t"
+        lines = ["{"]
+        for n in range(lanes):
+            x = element(a, n, unsigned, chunk, insn)
+            y = element(b, n, unsigned, chunk, insn)
+            # The result is truncated back to the chunk width by the store, so
+            # the wraparound is the instruction's, not the type's.
+            lines.append(f"    uint{bits}_t w{n} = ({x}) {sym} ({y});")
+        for n in range(lanes):
+            lines.append(f"    memcpy((char *){lane(index)} + {chunk * n}, &w{n}, {chunk});")
+        if width == 16 and vex:
+            lines += ["    " + z for z in upper_zeroed(index)]
+        lines.append("}")
+        return lines
+
+    if stem in VEC_UNPACK:
+        chunk, high = VEC_UNPACK[stem]
+        if len(ops) == 3:
+            dst, a, b = ops
+        elif len(ops) == 2:
+            dst, a, b = ops[0], ops[0], ops[1]
+        else:
+            raise Refused(f"{m} arity")
+        if not is_vec(dst):
+            raise Refused(f"{m} to memory")
+        index, width = vec(dst)
+        per_lane = 16 // chunk
+        picks = []
+        for base in range(0, width // chunk, per_lane):
+            half = per_lane // 2
+            for k in range(half):
+                at = base + k + (half if high else 0)
+                picks.append((a, at))
+                picks.append((b, at))
+        return weave(index, width, chunk, picks, insn, vex)
+
+    if stem in ("shufps", "shufpd", "shufss", "shufsd"):
+        if stem in ("shufss", "shufsd"):
+            raise Refused(m)
+        chunk = 4 if stem == "shufps" else 8
+        sel = ops[-1]
+        if sel.type != capstone.x86.X86_OP_IMM:
+            raise Refused(f"{m} without an immediate")
+        if len(ops) == 4:
+            dst, a, b = ops[0], ops[1], ops[2]
+        elif len(ops) == 3:
+            dst, a, b = ops[0], ops[0], ops[1]
+        else:
+            raise Refused(f"{m} arity")
+        if not is_vec(dst):
+            raise Refused(f"{m} to memory")
+        index, width = vec(dst)
+        per_lane = 16 // chunk
+        picks = []
+        for base in range(0, width // chunk, per_lane):
+            for n in range(per_lane):
+                # The low half of the lane comes from src1, the high half from
+                # src2, and the immediate names one source chunk per output.
+                shift = n * (2 if chunk == 4 else 1)
+                which = (sel.imm >> shift) & (3 if chunk == 4 else 1)
+                picks.append((a if n < per_lane // 2 else b, base + which))
+        return weave(index, width, chunk, picks, insn, vex)
+
+    if stem in ("blendvps", "blendvpd", "pblendvb"):
+        # A mask in a register: bit 31 (or 63) of each mask chunk selects. No
+        # immediate, so the choice is a runtime one — but still a bitwise one,
+        # which is what makes it expressible without a float model.
+        chunk = 8 if stem == "blendvpd" else 4
+        if len(ops) == 4:
+            dst, a, b, mask = ops
+        elif len(ops) == 3:
+            dst, a, b, mask = ops[0], ops[0], ops[1], ops[2]
+        else:
+            raise Refused(f"{m} arity")
+        if not is_vec(dst) or not is_vec(mask):
+            raise Refused(f"{m} form")
+        index, width = vec(dst)
+        lines = ["{"]
+        for n in range(width // chunk):
+            x = element(a, n, f"uint{chunk * 8}_t", chunk, insn)
+            y = element(b, n, f"uint{chunk * 8}_t", chunk, insn)
+            sel = element(mask, n, f"uint{chunk * 8}_t", chunk, insn)
+            top = f"(UINT{chunk * 8}_C(1) << {chunk * 8 - 1})"
+            lines.append(f"    uint{chunk * 8}_t w{n} = (({sel}) & {top}) ? ({y}) : ({x});")
+        for n in range(width // chunk):
+            lines.append(f"    memcpy((char *){lane(index)} + {chunk * n}, &w{n}, {chunk});")
+        if width == 16 and vex:
+            lines += ["    " + z for z in upper_zeroed(index)]
+        lines.append("}")
+        return lines
+
+    if stem in VEC_HADD and VEC_HADD[stem]:
+        ctype = "float" if stem == "haddps" else "double"
+        step = VEC_HADD[stem]
+        if len(ops) == 3:
+            dst, a, b = ops
+        elif len(ops) == 2:
+            dst, a, b = ops[0], ops[0], ops[1]
+        else:
+            raise Refused(f"{m} arity")
+        if not is_vec(dst):
+            raise Refused(f"{m} to memory")
+        index, width = vec(dst)
+        per_lane = 16 // step
+        half = per_lane // 2
+        lines = ["{"]
+        k = 0
+        for base in range(0, width // step, per_lane):
+            for source in (a, b):
+                for g in range(half):
+                    x = element(source, base + 2 * g, ctype, step, insn)
+                    y = element(source, base + 2 * g + 1, ctype, step, insn)
+                    lines.append(f"    {ctype} d{k} = ({x}) + ({y});")
+                    k += 1
+        for n in range(k):
+            lines.append(f"    memcpy((char *){lane(index)} + {step * n}, &d{n}, {step});")
+        if width == 16 and vex:
+            lines += ["    " + z for z in upper_zeroed(index)]
+        lines.append("}")
+        return lines
+
+    if stem in ("pmovmskb", "movmskps", "movmskpd"):
+        if len(ops) != 2 or is_vec(ops[0]) or not is_vec(ops[1]):
+            raise Refused(f"{m} form")
+        index, width = vec(ops[1])
+        if stem == "pmovmskb":
+            count, chunk = width, 1
+        elif stem == "movmskps":
+            count, chunk = width // 4, 4
+        else:
+            count, chunk = width // 8, 8
+        # The sign bit of each element, one per element, into a GPR — a bit
+        # image of the register rather than a number out of it.
+        lines = ["{", "    uint32_t k = 0;",
+                 f"    for (int n = 0; n < {count}; n++)",
+                 f"        k |= (uint32_t)(((const uint8_t *){lane(index)})[n * {chunk}"
+                 f" + {chunk - 1}] >> 7) << n;",
+                 f"    {wr(ops[0], '((uint32_t)k)', insn)}",
+                 "}"]
+        return lines
+
+    if stem in ("cvtsi2ss", "cvtsi2sd"):
+        ctype = "float" if stem == "cvtsi2ss" else "double"
+        step = 4 if stem == "cvtsi2ss" else 8
+        if len(ops) == 3:
+            dst, a, b = ops
+        elif len(ops) == 2:
+            dst, a, b = ops[0], ops[0], ops[1]
+        else:
+            raise Refused(f"{m} arity")
+        if not is_vec(dst):
+            raise Refused(f"{m} to memory")
+        index, width = vec(dst)
+        if b.type == capstone.x86.X86_OP_MEM:
+            bits = b.size * 8
+            value = f"(*(const int{bits}_t *)(uintptr_t){addr(b, insn)})"
+        elif b.type == capstone.x86.X86_OP_REG:
+            bi, bits, shift = SUBS[MD.reg_name(b.reg)]
+            raw = f"r[{bi}]" if shift == 0 else f"(r[{bi}] >> {shift})"
+            # Signed, which is what the instruction converts; `src` would hand
+            # back the unsigned view of the same bits.
+            value = f"((int{bits}_t){raw})"
+        else:
+            raise Refused(f"{m} source")
+        lines = ["{", f"    {ctype} d = ({ctype})({value});"]
+        if len(ops) == 3 and vec(a)[0] != index:
+            lines.append(f"    memcpy((char *){lane(index)} + {step}, "
+                         f"(const char *){lane(vec(a)[0])} + {step}, {width - step});")
+        lines.append(f"    memcpy((char *){lane(index)}, &d, {step});")
+        if width == 16 and vex:
+            lines += ["    " + z for z in upper_zeroed(index)]
+        lines.append("}")
+        return lines
+
+    if stem in VEC_SHIFT:
+        chunk, how = VEC_SHIFT[stem]
+        if len(ops) == 3:
+            dst, a, count = ops
+        elif len(ops) == 2:
+            dst, a, count = ops[0], ops[0], ops[1]
+        else:
+            raise Refused(f"{m} arity")
+        if not is_vec(dst):
+            raise Refused(f"{m} to memory")
+        index, width = vec(dst)
+        bits = chunk * 8
+        if count.type == capstone.x86.X86_OP_IMM:
+            shift = f"UINT64_C({count.imm & 0xFF})"
+        elif count.type == capstone.x86.X86_OP_MEM:
+            shift = f"(*(const uint64_t *)(uintptr_t){addr(count, insn)})"
+        else:
+            ci, _ = vec(count)
+            shift = f"v[{ci}][0]"
+        unsigned = f"uint{bits}_t"
+        lines = ["{", f"    uint64_t s = {shift};"]
+        for n in range(width // chunk):
+            x = element(a, n, unsigned, chunk, insn)
+            if how == "<<":
+                expr = f"(s > {bits - 1} ? 0 : (uint{bits}_t)(({x}) << s))"
+            elif how == ">>":
+                expr = f"(s > {bits - 1} ? 0 : (uint{bits}_t)(({x}) >> s))"
+            else:
+                # An arithmetic shift fills with the sign bit, and a count past
+                # the width leaves only sign bits — so it saturates at the width
+                # instead of being masked, which is what the instruction does.
+                expr = (f"(s > {bits - 1} ? ((int{bits}_t)({x}) >> {bits - 1})"
+                        f" : ((int{bits}_t)({x}) >> s))")
+            lines.append(f"    uint{bits}_t w{n} = {expr};")
+        for n in range(width // chunk):
+            lines.append(f"    memcpy((char *){lane(index)} + {chunk * n}, &w{n}, {chunk});")
+        if width == 16 and vex:
+            lines += ["    " + z for z in upper_zeroed(index)]
+        lines.append("}")
+        return lines
+
+    if stem in ("movlps", "movhps", "movlpd", "movhpd"):
+        # Half a register in or out of memory. `movhps` is the same operation at
+        # offset 8, and the register form of each is `movlhps`/`movhlps`, which
+        # is a half-width copy inside the file and is not this instruction.
+        at = 8 if stem in ("movhps", "movhpd") else 0
+        size = 8
+        if len(ops) == 3:
+            dst, a, source = ops
+        elif len(ops) == 2:
+            dst, a, source = ops[0], None, ops[1]
+        else:
+            raise Refused(f"{m} arity")
+        if is_vec(dst):
+            index, width = vec(dst)
+            if source.type != capstone.x86.X86_OP_MEM:
+                raise Refused(f"{m} register form")
+            lines = ["{"]
+            if len(ops) == 3 and a is not None and vec(a)[0] != index:
+                lines.append(f"    memcpy({lane(index)}, {lane(vec(a)[0])}, {width});")
+            elif vex and len(ops) == 2:
+                # The VEX form names only one half, and the other half is
+                # zeroed rather than kept — `vmovlps xmm1, m64` is not
+                # `movlps xmm1, m64`, which leaves 127:64 alone.
+                lines.append(f"    memset((char *){lane(index)} + {8 - at}, 0, {width - 8});")
+            lines.append(f"    memcpy((char *){lane(index)} + {at}, "
+                         f"(const void *)(uintptr_t){addr(source, insn)}, {size});")
+            if width == 16 and vex:
+                lines += ["    " + z for z in upper_zeroed(index)]
+            lines.append("}")
+            return lines
+        if source is not None and is_vec(source) and dst.type == capstone.x86.X86_OP_MEM:
+            index, _ = vec(source)
+            return [f"memcpy((void *)(uintptr_t){addr(dst, insn)}, "
+                    f"(const char *){lane(index)} + {at}, {size});"]
+        raise Refused(f"{m} form")
+
+    if stem in ("cvtdq2ps", "cvttps2dq"):
+        if len(ops) != 2:
+            raise Refused(f"{m} arity")
+        dst, source = ops
+        if not is_vec(dst):
+            raise Refused(f"{m} to memory")
+        index, width = vec(dst)
+        lanes = width // 4
+        lines = ["{"]
+        for n in range(lanes):
+            if stem == "cvtdq2ps":
+                # A 32-bit integer is not representable in a float exactly, and
+                # C's cast rounds to nearest-even, which is what the instruction
+                # does with MXCSR at its default.
+                x = element(source, n, "int32_t", 4, insn)
+                lines.append(f"    float w{n} = (float)({x});")
+            else:
+                # Truncation, and a lane that is NaN or outside int32 becomes
+                # INT32_MIN — the instruction's "integer indefinite", not the C
+                # cast's undefined behaviour.
+                x = element(source, n, "float", 4, insn)
+                lines.append(f"    float f{n} = {x};")
+                # The bounds are doubles on purpose: as a float, -2147483649.0
+                # rounds to -2^31 and would wrongly exclude it.
+                lines.append(f"    int32_t w{n} = ((double)f{n} > -2147483649.0"
+                             f" && (double)f{n} < 2147483648.0)"
+                             f" ? (int32_t)f{n} : INT32_MIN;")
+        for n in range(lanes):
+            lines.append(f"    memcpy((char *){lane(index)} + {4 * n}, &w{n}, 4);")
+        if width == 16 and vex:
+            lines += ["    " + z for z in upper_zeroed(index)]
+        lines.append("}")
+        return lines
+
+    if stem in VEC_CMP_INT:
+        chunk, rel = VEC_CMP_INT[stem]
+        if len(ops) == 3:
+            dst, a, b = ops
+        elif len(ops) == 2:
+            dst, a, b = ops[0], ops[0], ops[1]
+        else:
+            raise Refused(f"{m} arity")
+        if not is_vec(dst):
+            raise Refused(f"{m} to memory")
+        index, width = vec(dst)
+        bits = chunk * 8
+        lanes = width // chunk
+        # Signed, because that is what `pcmpgt` is; `pcmpeq` does not care.
+        signed = f"int{bits}_t"
+        lines = ["{"]
+        for n in range(lanes):
+            x = element(a, n, signed, chunk, insn)
+            y = element(b, n, signed, chunk, insn)
+            lines.append(f"    uint{bits}_t w{n} = (({x}) {rel} ({y}))"
+                         f" ? UINT{bits}_MAX : 0;")
+        for n in range(lanes):
+            lines.append(f"    memcpy((char *){lane(index)} + {chunk * n}, &w{n}, {chunk});")
+        if width == 16 and vex:
+            lines += ["    " + z for z in upper_zeroed(index)]
+        lines.append("}")
+        return lines
+
+    # `cmpps`/`cmppd`/`cmpss`/`cmpsd`, with the predicate either an immediate
+    # (`cmpps xmm0, xmm1, 3`) or folded into the mnemonic (`vcmpeqps`).
+    named = cmp_form(stem)
+    if named is not None or stem in ("cmpps", "cmppd", "cmpss", "cmpsd"):
+        if named is not None:
+            pred, packed, ctype = named
+            if len(ops) == 3:
+                dst, a, b = ops
+            elif len(ops) == 2:
+                dst, a, b = ops[0], ops[0], ops[1]
+            else:
+                raise Refused(f"{m} arity")
+        else:
+            ctype = "double" if stem.endswith(("pd", "sd")) else "float"
+            packed = stem.endswith(("ps", "pd"))
+            if len(ops) == 4:
+                dst, a, b, sel = ops
+            elif len(ops) == 3:
+                dst, a, b, sel = ops[0], ops[0], ops[1], ops[2]
+            else:
+                raise Refused(f"{m} arity")
+            if sel.type != capstone.x86.X86_OP_IMM:
+                raise Refused(f"{m} without a predicate")
+            pred = sel.imm & 7
+        if not is_vec(dst):
+            raise Refused(f"{m} to memory")
+        form = VEC_CMP_FLOAT[pred]
+        index, width = vec(dst)
+        step = 8 if ctype == "double" else 4
+        bits = step * 8
+        lanes = width // step if packed else 1
+        lines = ["{"]
+        for n in range(lanes):
+            x = element(a, n, ctype, step, insn)
+            y = element(b, n, ctype, step, insn)
+            cond = form.format(a=f"({x})", b=f"({y})")
+            lines.append(f"    uint{bits}_t w{n} = ({cond}) ? UINT{bits}_MAX : 0;")
+        if not packed and len(ops) == 4 and vec(a)[0] != index:
+            # The VEX scalar form takes the bits above the low element from
+            # src1; the legacy form leaves the destination's own in place.
+            lines.append(f"    memcpy((char *){lane(index)} + {step}, "
+                         f"(const char *){lane(vec(a)[0])} + {step}, {width - step});")
+        for n in range(lanes):
+            lines.append(f"    memcpy((char *){lane(index)} + {step * n}, &w{n}, {step});")
+        if width == 16 and vex:
+            lines += ["    " + z for z in upper_zeroed(index)]
+        lines.append("}")
+        return lines
+
     return None
 
 
@@ -519,10 +1065,39 @@ def lift_one(insn):
     """C statements for one instruction, or Refused."""
     m = insn.mnemonic
     ops = insn.operands
-    if m in ("nop", "endbr64"):
+    if m.startswith("lock "):
+        # Capstone names the locked forms by the whole thing — `lock cmpxchg`,
+        # `lock dec`, `lock xadd` — rather than as a prefix flag. The prefix
+        # buys atomicity against another core and a fence; this port has one
+        # thread and no other core, so what is left is the instruction. Careful
+        # in `branch.py`: the flags are the inner instruction's, so the prefix
+        # has to come off there too or a `jz` after `lock dec` is refused for
+        # not having a compare.
+        m = m[5:]
+    if m in ("nop", "endbr64", "pause"):
+        # `pause` is the spin-wait hint: it changes nothing a program can read.
         return []
-    if m in ("int3", "ud2"):
+    if m == "int3":
+        # The only `int3` a release build emits is the one MSVC puts after a
+        # call that does not return — the instruction is reached exactly when
+        # the program is already aborting. A port has nothing to break into, so
+        # it falls through; `ud2` is refused, because that one is deliberate.
+        return []
+    if m == "ud2":
         raise Refused(m)
+    if m in ("blsi", "blsmsk", "blsr"):
+        # BMI1, one-bit extraction: isolate the lowest set bit, mask up to and
+        # including it, or clear it. All three are defined at zero (`blsi` and
+        # `blsmsk` give zero, `blsr` gives zero) and all three set the flags
+        # from the result, which is why `branch.py` reads them as an ALU write.
+        if len(ops) != 2:
+            raise Refused(f"{m} arity")
+        bits = width(ops[1])
+        value = f"(uint{bits}_t)({src(ops[1], insn)})"
+        expr = {"blsi": f"({value}) & (0 - ({value}))",
+                "blsmsk": f"({value}) ^ (({value}) - 1)",
+                "blsr": f"({value}) & (({value}) - 1)"}[m]
+        return [wr(ops[0], expr, insn)]
     if m == "ret":
         return ["return;"]
     if m in FLOAT_COMPARE:
@@ -572,6 +1147,30 @@ def lift_one(insn):
         if mem.disp or not parts:
             parts.append(f"UINT64_C({mem.disp & 0xFFFFFFFFFFFFFFFF})")
         return [wr(ops[0], " + ".join(parts), insn)]
+    if m == "xadd":
+        # Exchange and add: the destination gets the sum, the source gets what
+        # the destination held. Both operands are read before either is written,
+        # which is the whole reason this is not two statements.
+        if len(ops) != 2:
+            raise Refused("xadd arity")
+        bits = width(ops[0])
+        wide = f"uint{bits}_t"
+        return [
+            "{",
+            f"    {wide} before = {src(ops[0], insn)}, addend = {src(ops[1], insn)};",
+            f"    {wr(ops[0], 'before + addend', insn)}",
+            f"    {wr(ops[1], 'before', insn)}",
+            "}",
+        ]
+    if m in ("tzcnt", "lzcnt"):
+        # Both are defined at zero, which is what separates them from `bsf` and
+        # `bsr`: the count is the operand's width, not an undefined result.
+        if len(ops) != 2:
+            raise Refused(f"{m} arity")
+        bits = width(ops[1])
+        value = f"(uint64_t)(uint{bits}_t)({src(ops[1], insn)})"
+        counter = "count_trailing" if m == "tzcnt" else "count_leading"
+        return [wr(ops[0], f"{counter}({value}, {bits})", insn)]
     if m in ("add", "sub", "and", "or", "xor"):
         if len(ops) != 2:
             raise Refused("alu arity")
@@ -1246,7 +1845,7 @@ def main():
     work = tempfile.mkdtemp(prefix="lift-")
     csrc = os.path.join(work, "lifted.c")
     head = ("#include <stdint.h>\n#include <stdio.h>\n#include <string.h>\n"
-            "#include <intrin.h>\nstatic uint64_t v[16][4];\n")
+            "#include <intrin.h>\nstatic uint64_t v[16][4];\n" + "\n".join(HELPERS) + "\n")
     whole = head + "\n".join(image_loader(pe)) + "\n" + "\n".join(body) + "\n" + driver
     with open(csrc, "w", encoding="utf-8") as f:
         f.write(whole)

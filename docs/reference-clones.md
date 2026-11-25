@@ -81,3 +81,26 @@ X2W 用三个 runner 互比（源构建 EXE / 映射 PE / AOT 重编译），**�
 后果是：**舍入模式与 DAZ/FTZ 都没有作为状态进差分**。函数自己存了再恢复就没事；如果哪一处
 `ldmxcsr` 改了模式却不恢复，被它影响的浮点结果就会落在"两侧进程各自的 MXCSR"上——和 TEB 一样，
 属于量具的边界。要收掉它，得让 `vldmxcsr`/`vstmxcsr` 进模型并把 MXCSR 记进用例记录。
+
+## 本轮又对上的三条上游提交（`25054241..1a0e506d` 区间）
+
+拉了一次 `origin/main`，`25054241` 之后的 30 多条提交**全部是 GPU/着色器侧**
+（mesh shader、SDWA、split sampler、depth-only pipeline……），x86 升举器没有新动作。
+CPU 侧最后一条仍是 `780f3c0a`（x87 `F2XM1`/`FYL2X`/`FYL2XP1`，1,239 行升举器 + 1,031 行逐位校验），
+本仓库的 x87 依然完全空白——这是接下来唯一"整族没做"的指令面。
+
+| 上游提交 | 内容 | 与本仓库这一轮的关系 |
+|---|---|---|
+| `6a127266` | `cpu_bmi1_aot`：`BLSI`/`BLSMSK`/`BLSR` | 这一轮实现了同样的三条。有意思的是它们的**零输入语义**：三个在源为 0 时都给出定义好的结果，所以不能拒绝，也不能靠 `bsf` 的"未定义"含糊过去 |
+| `b291e792` | VEX.128 `VPADDB`/`VPSUBB`/`VPCMPEQB`/`VPCMPGTB` | 这一轮把 `pcmpeq*`/`pcmpgt*` 做成了一张表（通道宽度 + C 关系），`vpsubb` 也进了 `VEC_INT_ARITH` | 
+| `4ea0c770` | `cpu_avx_test_aot`：`VPTEST`/`VTESTPS`/`VTESTPD` | 我们**还没做**：它写 ZF/CF（CF = `(a & b) == 0`，ZF = `(a & ~b) == 0`），是标志的生产者，所以不能只当一条 SIMD 指令塞进 `vec_line`——要走 `branch.py` 的 `pending`。拒绝面里 270 个 |
+
+`4ea0c770` 正好说明这个仓库现在的分层在哪里卡住：**凡是写 EFLAGS 的 SIMD 指令，都不属于"向量段"**。
+`vec_line` 的契约是"不碰标志"，所以 `vtestps`/`vptest`/`vucomiss` 都得在 `branch.py` 里有一条分支；
+`vucomiss` 已经这么做了（`FLOAT_COMPARE` + `kind == "fcom"`），`vtestps` 还没做。
+
+一条**仍然成立**的差异：上游把每一族做成独立文件 + 独立期望文件（`tests/cpu/*_check.py` 逐位比对），
+本仓库是一条 `lift_one` + 一张 `vec_line`。这一轮 `vec_line` 从 120 行长到 400 行，
+表驱动的部分（`VEC_BLEND`/`VEC_UNPACK`/`VEC_SHIFT`/`VEC_CMP_INT`/`VEC_HADD`）开始像一张指令表，
+而"表之外还有分支"的部分（`movlps` 的 VEX 两操作数形式清零、`haddpd` 的排布、`psrad` 的饱和）
+恰恰是最容易错的地方。拆不拆已经不是风格问题，而是"错的时候能不能只读一个文件就知道"。

@@ -128,6 +128,7 @@ def emit(kept, path, pe):
     names = sorted({rva for rva, _, _ in kept} | outer)
     lines = ["#include <stdint.h>", "#include <stdio.h>", "#include <string.h>",
              "#include <intrin.h>", "#include <setjmp.h>"]
+    lines += lift.HELPERS
     lines += lift.image_loader(pe)
     lines += [
         "#include <windows.h>",
@@ -144,6 +145,8 @@ def emit(kept, path, pe):
         "// The one slot a bridged call leaves different: the return address it",
         "// pushed, a host address here and an image address in a guest `call`.",
         "extern void guest_bridge(uint64_t *r, uint64_t *v, const void *target);",
+        "static void call_indirect(uint64_t *r, uint64_t target);",
+        "static void jump_indirect(uint64_t *r, uint64_t target);",
         "static uint64_t slots[SLOTS];",
         "static uint32_t nslots;",
         "static void note(uint64_t at) { if (nslots < SLOTS) slots[nslots++] = at; }",
@@ -179,6 +182,43 @@ def emit(kept, path, pe):
     for rva, _, _ in kept:
         if rva not in outer:
             lines += [f"void j_{rva:#x}(uint64_t *r) {{ f_{rva:#x}(r); }}"]
+    # The two hooks the branch pass emits where the call or jump target is a
+    # value. `call rax` cannot be resolved at translate time, but it can be
+    # resolved against the only thing that knows what the address means: the
+    # function table. One table, two entry points, because the stack protocol
+    # differs — a call returns here, a tail jump does not.
+    lines += [
+        "",
+        "// An indirect call names its target in a register, so the target is a",
+        "// value. This is the table that gives it a meaning: a lifted body where",
+        "// there is one, and the original bytes where there is not — which is not",
+        "// a fallback in the sense of being worse, it is the code the console ran.",
+        "static void route(uint64_t *r, uint64_t target, int tail) {",
+        "    switch (target - (uint64_t)(uintptr_t)img) {",
+    ]
+    lines += [f"    case {rva:#x}: if (tail) j_{rva:#x}(r); else f_{rva:#x}(r); return;"
+              for rva in names]
+    lines += [
+        "    default: break;",
+        "    }",
+        "    // Nothing lifted at that address. For a call the lift has already",
+        "    // pushed an image address at `r[4] - 8`; the bridge's own `call`",
+        "    // pushes a host address into that same slot, so it is reported and",
+        "    // the comparison skips it. For a tail jump `r[4]` already holds the",
+        "    // caller's return address and there is nothing to push.",
+        "    if (tail) {",
+        "        note(r[4] - 8);",
+        "        guest_bridge(r, v, (const void *)(uintptr_t)target);",
+        "    } else {",
+        "        r[4] += 8;",
+        "        note(r[4] - 8);",
+        "        guest_bridge(r, v, (const void *)(uintptr_t)target);",
+        "        r[4] -= 8;",
+        "    }",
+        "}",
+        "static void call_indirect(uint64_t *r, uint64_t target) { route(r, target, 0); }",
+        "static void jump_indirect(uint64_t *r, uint64_t target) { route(r, target, 1); }",
+    ]
     lines += [
         "static uint8_t *arena;",
         "",
