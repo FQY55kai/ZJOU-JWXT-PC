@@ -1,5 +1,10 @@
 # 路线图
 
+> **2026-11-26 停在这里，从这里接着做**：`tools/` 下已有 probe / lift / branch / diff / callgraph / functable，
+> oracle 可跑（40/40 对硬件一致）。下一步是 M1.5 的闭包升举：用 `functable.py` 长出 31.6 万函数起点，
+> 从 `callgraph.py` 给出一个闭包（几百个函数），逆拓扑序升举成一份 C，`call` 变直接调用，
+> 未覆盖目标落 `call_original(rva)`。差分改为"链接整份后跑入口"。
+
 每个 milestone 的验收标准都写在下面。**没有验收标准的工作不算完成。**
 
 ## M0 —— 链路打通（已完成）
