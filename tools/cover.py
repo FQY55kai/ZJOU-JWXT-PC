@@ -45,6 +45,7 @@ def main():
     passes = args.passes or ["plain", "branch"]
 
     pe = pefile.PE(args.exe, fast_load=True)
+    branch.set_image(pe)
     tally = {name: [0, collections.Counter()] for name in passes}
     seen = 0
     for rva, code in walk(pe):

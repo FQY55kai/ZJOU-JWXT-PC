@@ -91,6 +91,7 @@ def candidates_branch(exe, limit, max_bytes):
     import pefile
 
     pe = pefile.PE(exe, fast_load=True)
+    branch.set_image(pe)
     entry = pe.OPTIONAL_HEADER.DATA_DIRECTORY[3]
     table = pe.get_data(entry.VirtualAddress, entry.Size)
     picked = []

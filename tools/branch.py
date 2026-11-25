@@ -1,15 +1,35 @@
-"""Branches, without a flag register.
+"""Branches, jump tables and the flags they read, over a walked control flow.
 
 A full lifter models CF/OF/SF/ZF/AF/PF and every instruction that writes them.
 That is the correct end state and it is also three weeks of work that does not
 have to come first: in real code the overwhelming majority of branches read the
-flags of a `cmp`/`test` that is *right there*, one instruction earlier. So this
-pass recognises that shape and turns it into a comparison in C, and refuses
-everything else — `setcc`, `cmovcc`, `adc`, a `jcc` whose flags were written
-further back, a branch out of the function.
+flags of a `cmp`/`test` that is *right there*.
 
-What it does cover is the control flow that makes a function a function: labels,
-`goto`, loops, early returns — plus the straight-line body `lift` already knew.
+Two rules decide what is accepted, both taken from Xbox2Windows
+(`tools/cpu_switch_aot.py`, see docs/reference-clones.md):
+
+1. **Flags are modelled only between a producer and its consumers inside one
+   straight-line run that no other edge enters.** `Jcc`, `SETcc` and `CMOVcc`
+   consume; `mov`/`lea`/`not`/`bswap`/`push`/`pop`/`cbw`/`cwde`/`cdqe`/`cqo`
+   leave them alone; anything else that writes them ends the run. The producer
+   is `cmp`/`test`, or the result of an ALU op (ZF and SF are the result's;
+   carry and overflow are not the comparison a condition names, so those
+   conditions are refused).
+2. **Instructions are reached, not scanned.** MSVC puts a jump table after the
+   `jmp` that reads it, so a linear sweep decodes the table's own bytes as
+   instructions. The walk here starts at the entry and follows edges; whatever
+   no edge reaches is data.
+
+An indirect `jmp` is accepted only as the dispatch of one of these sequences,
+with the base the same RIP-relative address on the path and the index the one
+the guard compared:
+
+    mov E32, [B+I*4+table]; add E,B; jmp E   B = image base
+    movsxd E,[B+I*4];       add E,B; jmp E   B = table
+
+The dispatch becomes a `switch` over the table's targets. Everything else is
+refused: `adc`/`sbb`, a call or jump whose target is not an immediate, a `jcc`
+whose flags were written further back.
 """
 
 import capstone
@@ -21,12 +41,22 @@ UNSIGNED = {"a": ">", "ae": ">=", "b": "<", "be": "<="}
 SIGNED = {"g": ">", "ge": ">=", "l": "<", "le": "<="}
 EQUALITY = {"e": "==", "ne": "!="}
 
+# Instructions whose ZF and SF the next consumer can read off the result: the
+# destination holds it, so a snapshot of the destination right after the write
+# is the flag's source. CF and OF are *not* covered — after `add` they mean
+# carry and signed overflow, not the comparison the condition names — so only
+# e/ne/s/ns may read these.
+FLAG_FROM_RESULT = {"add", "sub", "and", "or", "xor", "inc", "dec", "neg"}
+
 # Instructions that leave the flags alone, so a compare stays live across them.
 # Everything else that is not a consumer invalidates it: a `cmp` followed by an
 # `add` and then a `jz` branches on the add, not on the compare.
 FLAG_SAFE = {
-    "mov", "movzx", "movsx", "movsxd", "movabs", "lea", "not", "bswap", "nop",
+    "mov", "movabs", "movzx", "movsx", "movsxd", "lea", "not", "bswap", "nop",
     "push", "pop", "cbw", "cwde", "cdqe", "cdq", "cqo", "xchg", "endbr64",
+    "sete", "setne", "sets", "setns", "seta", "setae", "setb", "setbe",
+    "setg", "setge", "setl", "setle", "setc", "setnc", "seto", "setno",
+    "setp", "setnp",
 }
 
 
@@ -38,10 +68,49 @@ class Refused(Exception):
 # without decoding everything twice.
 CALLS: dict[int, set[int]] = {}
 
+# The image, for reading jump tables. Set once by whoever holds the PE.
+_IMAGE = None
+
+
+def set_image(pe):
+    """Bind the image so a dispatch's table can be read. Optional: without it a
+    jump table is refused rather than guessed."""
+    global _IMAGE
+    _IMAGE = pe
+
+
+def image_bytes(rva, length):
+    if _IMAGE is None:
+        raise Refused("jump table without the image")
+    data = _IMAGE.get_data(rva, length)
+    if len(data) != length:
+        raise Refused("jump table outside the image")
+    return data
+
 
 def condition(pending, suffix):
     """The C condition for a consumer of `pending`, or Refused."""
     kind, a, b, bits = pending
+    if kind == "cf":
+        # `BT` selects one bit into CF and leaves the rest untouched, so only
+        # the carry conditions may read it.
+        if suffix in ("c", "b"):
+            return f"(({a}) != 0)"
+        if suffix in ("nc", "ae"):
+            return f"(({a}) == 0)"
+        raise Refused(f"cf only for carry, not {suffix}")
+    if kind == "alu":
+        if suffix == "e":
+            return f"(({a}) == 0)"
+        if suffix == "ne":
+            return f"(({a}) != 0)"
+        if suffix == "s":
+            return f"((({a}) >> {bits - 1}) & 1)"
+        if suffix == "ns":
+            return f"!((({a}) >> {bits - 1}) & 1)"
+        # Carry, overflow and parity after an ALU op are not the comparison the
+        # condition names (`jb` after `add` reads the carry-out).
+        raise Refused(f"alu result only for zf/sf, not {suffix}")
     if kind == "test":
         if suffix == "e":
             return f"(({a}) == 0)"
@@ -51,6 +120,22 @@ def condition(pending, suffix):
             return f"((({a}) >> {bits - 1}) & 1)"
         if suffix == "ns":
             return f"!((({a}) >> {bits - 1}) & 1)"
+        # `TEST` clears CF and OF, so the signed conditions are the sign bit's
+        # and the carry conditions are constants — `jb` after `test` never
+        # branches, `jae` always does.
+        sign = f"((({a}) >> {bits - 1}) & 1)"
+        if suffix == "l":
+            return sign
+        if suffix == "ge":
+            return f"!{sign}"
+        if suffix == "le":
+            return f"((({a}) == 0) || {sign})"
+        if suffix == "g":
+            return f"((({a}) != 0) && !{sign})"
+        if suffix == "b":
+            return "0"
+        if suffix == "ae":
+            return "1"
         raise Refused(f"test {suffix}")
     if suffix in EQUALITY:
         return f"(({a}) {EQUALITY[suffix]} ({b}))"
@@ -63,39 +148,155 @@ def condition(pending, suffix):
     raise Refused(f"condition {suffix}")
 
 
+def _reg_index(op):
+    """The index of an operand's parent register, or None."""
+    if op.type != capstone.x86.X86_OP_REG:
+        return None
+    name = module.MD.reg_name(op.reg)
+    return module.SUBS[name][0] if name in module.SUBS else None
+
+
+def _guard_bound(before, index):
+    """`cmp I, n; ja L` in front of the dispatch: the table holds n+1 entries."""
+    for insn in reversed(before[-4:]):
+        if insn.mnemonic in ("ja", "jae", "jb", "jbe"):
+            continue
+        if insn.mnemonic == "cmp" and len(insn.operands) == 2:
+            if _reg_index(insn.operands[0]) == index and insn.operands[1].type == capstone.x86.X86_OP_IMM:
+                return insn.operands[1].imm
+    return None
+
+
+def _dispatch(recent, jmp, start, end):
+    """The jump table a `jmp reg` dispatches through, or None.
+
+    `recent` holds the last few instructions before the `jmp`, oldest first. The
+    shape is `add E,B; jmp E` on top of `movsxd E,[B+I*4]` and a `lea B,[rip+t]`.
+    """
+    if len(recent) < 3 or not jmp.operands:
+        return None
+    add, load, lea = recent[-1], recent[-2], recent[-3]
+    target = _reg_index(jmp.operands[0])
+    if target is None or add.mnemonic != "add" or len(add.operands) != 2:
+        return None
+    if _reg_index(add.operands[0]) != target:
+        return None
+    if add.operands[1].type != capstone.x86.X86_OP_REG:
+        return None
+    base = _reg_index(add.operands[1])
+    if base is None or base == target:
+        return None
+    if load.mnemonic not in ("movsxd", "mov") or len(load.operands) != 2:
+        return None
+    if _reg_index(load.operands[0]) != target:
+        return None
+    mem = load.operands[1]
+    if mem.type != capstone.x86.X86_OP_MEM or mem.mem.scale != 4 or mem.mem.base == 0:
+        return None
+    if module.SUBS[module.MD.reg_name(mem.mem.base)][0] != base or mem.mem.index == 0:
+        return None
+    index = module.SUBS[module.MD.reg_name(mem.mem.index)][0]
+    if lea.mnemonic != "lea" or len(lea.operands) != 2 or _reg_index(lea.operands[0]) != base:
+        return None
+    if lea.operands[1].type != capstone.x86.X86_OP_MEM:
+        return None
+    if lea.operands[1].mem.base == 0 or module.MD.reg_name(lea.operands[1].mem.base) != "rip":
+        return None
+    table = module.rip_target(lea, lea.operands[1].mem.disp) + mem.mem.disp
+
+    # How many entries: the guard's bound when one is in reach, else up to the
+    # first entry that leaves the function (the table is the only thing there).
+    bound = _guard_bound(recent[:-3], index)
+    entries = []
+    limit = bound + 1 if bound is not None else 1024
+    for k in range(limit):
+        entry = int.from_bytes(image_bytes(table + 4 * k, 4), "little", signed=True)
+        case = table + entry
+        if not start <= case < end:
+            if bound is None:
+                break
+            raise Refused("jump table entry leaves the function")
+        entries.append(case)
+    if not entries:
+        return None
+    return {"index": index, "entries": entries, "table": table}
+
+
+def walk(code, rva):
+    """Decode every instruction an edge reaches, and the dispatches met.
+
+    Straight-line runs are decoded forward; a branch enqueues its target and a
+    `jmp` ends the run. A jump table enqueues its cases, so the table's own
+    bytes (which sit inside the function) are never decoded as code.
+    """
+    end = rva + len(code)
+    insns = {}
+    starts = set()
+    calls = set()
+    dispatches = {}
+    todo = [rva]
+    while todo:
+        at = todo.pop()
+        if at in starts or not rva <= at < end:
+            continue
+        starts.add(at)
+        recent = []
+        while True:
+            if not rva <= at < end or at in insns:
+                break
+            insn = next(module.MD.disasm(code[at - rva:at - rva + 15], at), None)
+            if insn is None:
+                raise Refused("undecodable")
+            insns[at] = insn
+            m = insn.mnemonic
+            nxt = at + insn.size
+            if m == "call":
+                if not insn.operands or insn.operands[0].type != capstone.x86.X86_OP_IMM:
+                    raise Refused("indirect call")
+                calls.add(insn.operands[0].imm)
+            elif m in ("ret", "retf"):
+                break
+            elif m == "jmp":
+                op = insn.operands[0] if insn.operands else None
+                if op is None:
+                    raise Refused("jmp without an operand")
+                if op.type == capstone.x86.X86_OP_IMM:
+                    if rva <= op.imm < end:
+                        todo.append(op.imm)
+                    else:
+                        calls.add(op.imm)  # a tail call: the frame goes with it
+                    break
+                table = _dispatch(recent, insn, rva, end)
+                if table is None:
+                    raise Refused("indirect branch")
+                dispatches[at] = table
+                for case in table["entries"]:
+                    if rva <= case < end:
+                        todo.append(case)
+                    else:
+                        raise Refused("jump table entry out of the function")
+                break
+            elif m.startswith("j"):
+                op = insn.operands[0]
+                if op.type != capstone.x86.X86_OP_IMM:
+                    raise Refused("indirect branch")
+                if rva <= op.imm < end:
+                    todo.append(op.imm)
+                else:
+                    raise Refused("branch out of the function")
+            recent.append(insn)
+            if len(recent) > 4:
+                recent.pop(0)
+            at = nxt
+    return insns, starts, calls, dispatches
+
+
 def lift_function(code, rva):
     """C statements for a function with branches, or Refused."""
-    insns = list(module.MD.disasm(code, rva))
-    while insns and insns[-1].mnemonic in ("int3", "nop", "ud2"):
-        insns.pop()
+    insns, starts, calls, dispatches = walk(code, rva)
     if not insns:
         raise Refused("empty")
-    if insns[-1].mnemonic not in ("ret", "jmp"):
-        raise Refused("does not end in ret")
-
-    calls: set[int] = set()
     start, end = rva, rva + len(code)
-    targets = set()
-    for insn in insns:
-        m = insn.mnemonic
-        if m.startswith("j"):
-            if not insn.operands or insn.operands[0].type != capstone.x86.X86_OP_IMM:
-                raise Refused("indirect branch")
-            target = insn.operands[0].imm
-            if not start <= target < end:
-                # Out of range is a tail call, not an error: the function hands
-                # its frame to another one and returns when that returns.
-                if insn.mnemonic == "jmp":
-                    calls.add(target)
-                    continue
-                raise Refused("branch out of the function")
-            targets.add(target)
-        if m == "call":
-            aops = insn.operands
-            if aops and aops[0].type == capstone.x86.X86_OP_IMM:
-                calls.add(aops[0].imm)
-            else:
-                raise Refused("indirect call")
 
     out = []
     # `cmp`/`test` seen but not yet consumed by a branch: the operands as C.
@@ -104,10 +305,26 @@ def lift_function(code, rva):
     # flag-neutral `mov` in between can overwrite a register the compare read:
     # `cmp eax, 0 / mov eax, [rbx] / jz L` branches on the *old* eax.
     snap = 0
-    for insn in insns:
+    for at in sorted(insns):
+        insn = insns[at]
+        # A run that an edge enters cannot borrow the flags of the run before it.
+        if at in starts:
+            pending = None
+            out.append(f"L{at:#x}: ;")
         m, ops = insn.mnemonic, insn.operands
-        if insn.address in targets:
-            out.append(f"L{insn.address:#x}: ;")
+        if at in dispatches:
+            table = dispatches[at]
+            snap += 1
+            out.append(f"uint64_t i{snap} = r[{table['index']}];")
+            out.append(f"switch (i{snap}) {{")
+            for k, case in enumerate(table["entries"]):
+                out.append(f"case {k}: goto L{case:#x};")
+            # Unreachable on the console: the guard in front of the dispatch
+            # bounds the index. Ending the function is what a stray index would
+            # do here anyway, without running off the end of the switch.
+            out.append("default: return;")
+            out.append("}")
+            continue
         if m in ("cmp", "test"):
             snap += 1
             a, b = module.src(ops[0], insn), module.src(ops[1], insn)
@@ -117,12 +334,10 @@ def lift_function(code, rva):
         if m.startswith("j") and m != "jmp":
             if pending is None:
                 raise Refused(f"{m} without a compare")
-            kind, a, b, bits = pending
-            pending = None
             suffix = m[1:]
-            target = ops[0].imm
-            cond = condition((kind, a, b, bits), suffix)
-            out.append(f"if ({cond}) goto L{target:#x};")
+            cond = condition(pending, suffix)
+            pending = None
+            out.append(f"if ({cond}) goto L{ops[0].imm:#x};")
             continue
         if m == "jmp":
             target = ops[0].imm
@@ -131,6 +346,18 @@ def lift_function(code, rva):
             else:
                 out.append(f"f_{target:#x}(r, stk);")
                 out.append("return;")
+            continue
+        if m == "bt":
+            if len(ops) != 2:
+                raise Refused("bt arity")
+            bits = module.width(ops[0])
+            if ops[0].type == capstone.x86.X86_OP_MEM and ops[1].type != capstone.x86.X86_OP_IMM:
+                raise Refused("bt memory with a register offset")
+            snap += 1
+            out.append(f"uint64_t a{snap} = {module.src(ops[0], insn)};")
+            offset = str(ops[1].imm) if ops[1].type == capstone.x86.X86_OP_IMM else module.src(ops[1], insn)
+            out.append(f"uint64_t b{snap} = (a{snap} >> ({offset} & {bits - 1})) & 1;")
+            pending = ("cf", f"b{snap}", None, bits)
             continue
         if m.startswith("set") or m.startswith("cmov"):
             suffix = m[3:] if m.startswith("set") else m[4:]
@@ -143,22 +370,21 @@ def lift_function(code, rva):
             else:
                 out.append(f"if ({cond}) {module.wr(ops[0], module.src(ops[1], insn), insn)}")
             continue
-        if m in ("adc", "sbb", "rcl", "rcr"):
+        if m in ("adc", "sbb", "rcl", "rcr", "bts", "btr", "btc"):
             raise Refused(m)
-        if m not in FLAG_SAFE:
-            # Nothing here reads the flags, but this writes them: a later
-            # branch must not use the compare before it.
-            pending = None
         if m == "call":
-            target = ops[0].imm
-            out.append(f"f_{target:#x}(r, stk);")
+            out.append(f"f_{ops[0].imm:#x}(r, stk);")
             pending = None  # a call does not preserve the flags
             continue
-
+        if m not in FLAG_SAFE:
+            pending = None
         out.extend(module.lift_one(insn))
-        # A write to a flag-setting instruction invalidates the pending compare
-        # only if something later reads flags we did not model; since nothing
-        # does (any reader is refused), the pending compare can stay until a
-        # branch consumes it.
+        if m in FLAG_FROM_RESULT:
+            # ZF and SF are the result's, and the result is in the destination
+            # now — but a later `mov` may overwrite it before the branch reads
+            # the flag, so it is snapshotted here.
+            snap += 1
+            out.append(f"uint64_t a{snap} = (uint64_t)({module.src(ops[0], insn)});")
+            pending = ("alu", f"a{snap}", None, module.width(ops[0]))
     CALLS[rva] = calls
     return out

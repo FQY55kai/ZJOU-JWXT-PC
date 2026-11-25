@@ -107,6 +107,7 @@ def main():
     args = ap.parse_args()
 
     pe = pefile.PE(args.exe, fast_load=True)
+    branch.set_image(pe)
     funcs = table(pe)
 
     def code_of(rva):
