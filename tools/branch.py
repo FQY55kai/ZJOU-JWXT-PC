@@ -344,7 +344,10 @@ def lift_function(code, rva):
             if start <= target < end:
                 out.append(f"goto L{target:#x};")
             else:
-                out.append(f"f_{target:#x}(r, stk);")
+                # A tail jump passes its caller's return address through: no
+                # push, no frame, and the callee's `ret` leaves for the
+                # caller of this function, not for us.
+                out.append(f"j_{target:#x}(r);")
                 out.append("return;")
             continue
         if m == "bt":
@@ -373,7 +376,15 @@ def lift_function(code, rva):
         if m in ("adc", "sbb", "rcl", "rcr", "bts", "btr", "btc"):
             raise Refused(m)
         if m == "call":
-            out.append(f"f_{ops[0].imm:#x}(r, stk);")
+            # The hardware pushes a return address at `rsp - 8` and enters the
+            # callee with `rsp` there. Reproduce both, or every frame the callee
+            # builds sits eight bytes off and the stack it leaves behind is not
+            # the stack the original left behind.
+            ret = at + insn.size
+            out.append(f"*(uint64_t *)(uintptr_t)(r[4] - 8) = (uint64_t)(img + {ret:#x});")
+            out.append("r[4] -= 8;")
+            out.append(f"f_{ops[0].imm:#x}(r);")
+            out.append("r[4] += 8;")
             pending = None  # a call does not preserve the flags
             continue
         if m not in FLAG_SAFE:

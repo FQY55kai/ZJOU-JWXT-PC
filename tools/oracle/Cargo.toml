@@ -3,6 +3,15 @@ name = "oracle"
 version = "0.1.0"
 edition = "2021"
 
+# The binary is the judge: it runs a batch of cases and reports the registers and
+# the arena. The cdylib exports the same stub as `guest_bridge`, which the
+# generated C links against so that a lifted function can still call code that
+# has not been lifted yet.
+[lib]
+name = "oracle_guest"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
 [[bin]]
 name = "oracle"
 path = "src/main.rs"

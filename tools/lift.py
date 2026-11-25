@@ -3,8 +3,8 @@
 The point of this file is not coverage: it is to prove the pipeline on the
 title's own code before anyone writes the general case. It walks `.pdata`'s
 function table, keeps the functions a first lifter can hand to C (no calls, no
-branches, no flags read, memory only through `rsp`), emits them as
-`void f(uint64_t *r, uint8_t *stk)` where `r[0..15]` are rax..r15, compiles that
+branches, no flags read), emits them as
+`void f(uint64_t *r)` where `r[0..15]` are rax..r15, compiles that
 with the host's own MSVC, runs it on random inputs, and compares against an
 interpreter written here, independently of the emitter.
 
@@ -41,6 +41,27 @@ STACK = 0x100  # bytes of scratch stack each call gets
 # first three instructions.
 IMAGE_BASE = 0x140000000
 IMAGE_SIZE = 0xB06D000
+
+# A literal backslash-n, for the C strings emitted below: this file generates C,
+# and writing the escape directly would put a line break in a string literal.
+NL = chr(92) + "n"
+
+# The arena: one fixed window, allocated by both sides of the differential
+# harness at the same address, where every register but `rsp` points on entry.
+# Guest pointers are host pointers, so this is not a buffer to index — it is
+# 16 KiB of address space that happens to have something mapped in it. 128 GiB
+# is below the Win64 user limit and far from the image, so a wild displacement
+# faults instead of quietly landing in the other region.
+ARENA = 0x2000000000
+ARENA_SIZE = 0x4000
+RSP0 = ARENA + 0x2000  # entry rsp, 8 KiB in, so a frame has room either way
+MASK64 = 0xFFFFFFFFFFFFFFFF
+
+# How far a displacement off a register may reach and still name a place the
+# harness has mapped. Registers are placed at ARENA+0x1000..0x1800 and `rsp` at
+# RSP0, so this bound keeps every access inside the arena and makes an
+# out-of-bounds one a bug rather than a near miss.
+MAX_DISP = 0x1000
 
 MD = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
 MD.detail = True
@@ -108,26 +129,29 @@ def width(op):
     raise Refused("width of an immediate")
 
 
-def stack_slot(op, bits=64, insn=None):
-    """The guest stack: `stk`, addressed by offset, at the accessed width.
+def mem(op, bits=64, insn=None):
+    """A memory operand as a real host address.
 
-    The width matters on the way in as well as out: `mov dword ptr [rbp-4], eax`
-    leaves the four bytes above it alone, and a `uint64_t` store there would
-    quietly flatten the neighbouring local.
+    Guest pointers are host pointers: the image is mapped at its preferred base
+    and the heap is the host's, so `mov [rcx], rax` is a store where rcx points,
+    with nothing in between. An earlier version addressed a 256-byte scratch
+    buffer by taking the low byte of the address, which is only right when the
+    address happens to be near that buffer — and rules out every function that
+    writes through an argument, which is most of them.
 
-    `[rip + d]` is not the stack: it is a fixed place in the image, known at
-    lift time, so it becomes an absolute offset into `img`.
+    `[rip + d]` is not a pointer to compute: it is a fixed place in the image,
+    known at lift time, so it becomes `img + rva`.
     """
     if op.type != capstone.x86.X86_OP_MEM:
         raise Refused("not memory")
     m = op.mem
     if m.segment != 0:
         raise Refused("segment")
+    if m.base and MD.reg_name(m.base) == "rip":
+        return f"*(uint{bits}_t *)(img + {rip_target(insn, m.disp):#x})"
     terms = []
     if m.base:
         base = MD.reg_name(m.base)
-        if base == "rip":
-            return f"*(uint{bits}_t *)(img + {rip_target(insn, m.disp):#x})"
         if base not in SUBS:
             raise Refused(f"base {base}")
         terms.append(f"r[{SUBS[base][0]}]")
@@ -139,7 +163,7 @@ def stack_slot(op, bits=64, insn=None):
     if m.disp:
         terms.append(str(m.disp))
     inner = " + ".join(terms) if terms else "0"
-    return f"*(uint{bits}_t *)(stk + (({inner}) & 255))"
+    return f"*(uint{bits}_t *)(uintptr_t)({inner})"
 
 
 def rip_target(insn, disp):
@@ -171,7 +195,7 @@ def src(op, insn=None):
             return f"r[{index}]"
         inner = f"r[{index}]" if shift == 0 else f"(r[{index}] >> {shift})"
         return f"((uint{bits}_t){inner})"
-    return stack_slot(op, op.size * 8, insn)
+    return mem(op, op.size * 8, insn)
 
 
 def wr(op, expr, insn=None):
@@ -188,7 +212,7 @@ def wr(op, expr, insn=None):
             # A 32-bit write zeroes the top half on x86-64; this is not a cast.
             return f"r[{index}] = (uint64_t)(uint32_t)({expr});"
         return f"r[{index}] = (r[{index}] & ~{ONES[bits]}) | ((uint64_t)({expr}) & {ONES[bits]});"
-    return f"{stack_slot(op, op.size * 8, insn)} = {expr};"
+    return f"{mem(op, op.size * 8, insn)} = {expr};"
 
 
 def lift_one(insn):
@@ -202,9 +226,9 @@ def lift_one(insn):
     if m == "ret":
         return ["return;"]
     if m == "push":
-        return ["r[4] -= 8;", f"*(uint64_t *)(stk + ((r[4]) & 255)) = {src(ops[0], insn)};"]
+        return ["r[4] -= 8;", f"*(uint64_t *)(uintptr_t)(r[4]) = {src(ops[0], insn)};"]
     if m == "pop":
-        return [wr(ops[0], "*(uint64_t *)(stk + ((r[4]) & 255))", insn), "r[4] += 8;"]
+        return [wr(ops[0], "*(uint64_t *)(uintptr_t)(r[4])", insn), "r[4] += 8;"]
     if m in ("mov", "movabs"):
         # `movabs` is capstone's name for the 10-byte `mov r64, imm64`, which is
         # how an absolute address reaches a register.
@@ -283,6 +307,21 @@ def lift_one(insn):
     raise Refused(m)
 
 
+def imports(pe):
+    """(IAT rva, DLL, name or None, ordinal) for every imported function."""
+    import pefile
+
+    pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"]])
+    base = pe.OPTIONAL_HEADER.ImageBase
+    out = []
+    for entry in getattr(pe, "DIRECTORY_ENTRY_IMPORT", []):
+        dll = entry.dll.decode("ascii", "replace")
+        for imp in entry.imports:
+            name = imp.name.decode("ascii", "replace") if imp.name else None
+            out.append((imp.address - base, dll, name, imp.ordinal or 0))
+    return out
+
+
 def image_loader(pe=None):
     """C that maps the image at its preferred base, so `img + rva` resolves.
 
@@ -302,6 +341,7 @@ def image_loader(pe=None):
         f"#define IMG_SIZE 0x{IMAGE_SIZE:x}ull",
         "",
         "static uint8_t *img;",
+        "static void fix_imports(void);",
         "",
     ]
     if pe is None:
@@ -316,10 +356,12 @@ def image_loader(pe=None):
         "",
         "static int map_image(const char *path) {",
         "    HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);",
-        "    if (f == INVALID_HANDLE_VALUE) return 0;",
+        f'    if (f == INVALID_HANDLE_VALUE) {{ fprintf(stderr, "open %s: %lu{NL}", path, GetLastError()); return 0; }}',
+        "    // Execute as well as write: a bridged call runs the original bytes",
+        "    // straight out of this mapping, and the title writes its own globals.",
         "    img = (uint8_t *)VirtualAlloc((void *)(uintptr_t)IMG_BASE, IMG_SIZE,",
-        "                                  MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);",
-        "    if (!img) { CloseHandle(f); return 0; }",
+        "                                  MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);",
+        f'    if (!img) {{ fprintf(stderr, "map: %lu{NL}", GetLastError()); CloseHandle(f); return 0; }}',
         "    for (unsigned i = 0; i < sizeof IMG_SECTIONS / sizeof IMG_SECTIONS[0]; i++) {",
         "        LARGE_INTEGER at; DWORD done = 0;",
         "        at.QuadPart = IMG_SECTIONS[i].off;",
@@ -327,11 +369,143 @@ def image_loader(pe=None):
         "        ReadFile(f, img + IMG_SECTIONS[i].rva, IMG_SECTIONS[i].size, &done, NULL);",
         "    }",
         "    CloseHandle(f);",
+        "    fix_imports();",
         "    return 1;",
         "}",
         "",
     ]
+    rows = []
+    for entry in imports(pe):
+        iat, dll, name, ordinal = entry
+        label = "NULL" if name is None else '"%s"' % name.replace('"', "")
+        # Field order matters and matches the struct below: at, ordinal, name, dll.
+        rows.append('{ %d, %d, %s, "%s" }'
+                    % (iat, ordinal if name is None else 0, label, dll))
+    if rows:
+        lines += [
+            "// The import table, so that a `jmp [__imp_Foo]` lands on Foo and not",
+            "// on the hint/name pair the linker left in the slot. A recompiled",
+            "// binary needs this for the same reason a loader does.",
+            "static const struct { uint32_t at, ordinal; const char *name, *dll; } IMG_IMPORTS[] = {",
+            "    " + ",\n    ".join(rows),
+            "};",
+            "",
+            "static void fix_imports(void) {",
+            "    HMODULE last = NULL; const char *dll = NULL;",
+            "    for (unsigned i = 0; i < sizeof IMG_IMPORTS / sizeof IMG_IMPORTS[0]; i++) {",
+            "        if (!dll || strcmp(dll, IMG_IMPORTS[i].dll)) {",
+            "            dll = IMG_IMPORTS[i].dll;",
+            "            last = LoadLibraryA(dll);",
+            "        }",
+            "        if (!last) continue;",
+            "        FARPROC fn = IMG_IMPORTS[i].name",
+            "            ? GetProcAddress(last, IMG_IMPORTS[i].name)",
+            "            : GetProcAddress(last, (LPCSTR)(uintptr_t)IMG_IMPORTS[i].ordinal);",
+            "        *(uint64_t *)(img + IMG_IMPORTS[i].at) = (uint64_t)(uintptr_t)fn;",
+            "    }",
+            "}",
+            "",
+        ]
     return lines
+
+
+def balanced(code, rva):
+    """True when every `ret` leaves `rsp` where it found it.
+
+    A function whose exit frame differs from its entry one is a fragment of
+    another function (a cold block, a funclet): its `ret` reads a return address
+    the parent pushed, so entering it from a harness pops whatever the stack
+    holds and jumps into it.
+
+    Statically this is a running `rsp` delta, and `rbp` has to be carried along
+    because the ordinary MSVC epilogue is `mov rsp, rbp; pop rbp; ret`. When
+    either register is set to something this cannot follow — `and rsp, -16` —
+    the delta becomes unknown and the function is not entered, which is the safe
+    direction.
+    """
+    reg = capstone.x86.X86_OP_REG
+
+    def immediate(ops):
+        if len(ops) != 2 or ops[1].type != capstone.x86.X86_OP_IMM:
+            return None
+        return ops[1].imm
+
+    rsp, rbp = 0, None  # offsets from the entry `rsp`
+    for insn in MD.disasm(code, rva):
+        m, ops = insn.mnemonic, insn.operands
+        first = MD.reg_name(ops[0].reg) if ops and ops[0].type == reg else ""
+        if m == "push":
+            rsp -= 8
+        elif m == "pop" and first == "rsp":
+            return False  # `pop rsp` is a jump in disguise
+        elif m == "pop":
+            rsp += 8  # `pop rbp` reloads the frame pointer; rbp is then unknown
+        elif m in ("add", "sub") and first == "rsp":
+            n = immediate(ops)
+            if n is None:
+                return False
+            rsp = rsp + n if m == "add" else rsp - n
+        elif m == "lea" and first == "rsp":
+            if len(ops) != 2 or ops[1].type != capstone.x86.X86_OP_MEM:
+                return False
+            if ops[1].mem.index or not ops[1].mem.base:
+                return False
+            if MD.reg_name(ops[1].mem.base) != "rsp":
+                return False
+            rsp += ops[1].mem.disp
+        elif m == "leave":
+            if rbp is None:
+                return False
+            rsp = rbp + 8
+        elif m == "mov" and len(ops) == 2 and ops[1].type == reg:
+            source = MD.reg_name(ops[1].reg)
+            if first == "rsp" and source == "rbp":
+                if rbp is None:
+                    return False
+                rsp = rbp
+            elif first == "rbp" and source == "rsp":
+                rbp = rsp
+            elif first in ("rsp", "rbp"):
+                return False
+        elif m == "mov" and first in ("rsp", "rbp"):
+            return False
+        elif m == "ret":
+            if rsp != 0:
+                return False
+    return True
+
+
+def reachable(code, rva):
+    """True when every memory operand names a place the harness has mapped.
+
+    No `gs:`/`fs:`, no scaled index off a pointer (an address built from two
+    arbitrary registers is not a place a test can predict), no displacement
+    past the arena. `[rip+d]` is a fixed offset into the image and both sides
+    have the image.
+    """
+    for insn in MD.disasm(code, rva):
+        for op in insn.operands:
+            if op.type != capstone.x86.X86_OP_MEM:
+                continue
+            if op.mem.segment:
+                return False
+            base = MD.reg_name(op.mem.base) if op.mem.base else ""
+            if base == "rip":
+                if not 0 <= insn.address + insn.size + op.mem.disp < IMAGE_SIZE:
+                    return False
+                continue
+            if op.mem.index:
+                return False
+            if not base:
+                # An absolute operand: correct only while the image sits at the
+                # base it asks for, which it does on both sides.
+                at = op.mem.disp & 0xFFFFFFFFFFFFFFFF
+                if not IMAGE_BASE <= at < IMAGE_BASE + IMAGE_SIZE:
+                    return False
+                continue
+            if not -MAX_DISP <= op.mem.disp < MAX_DISP:
+                return False
+    return True
 
 
 def lift_function(code, base_rva):
@@ -368,97 +542,120 @@ def load_image(pe):
     return data
 
 
-def interpret(code, base_rva, regs, stk, image=None):
-    # Eight bytes of slack, so a read at the very top of the stack does not
-    # raise. Writing it back through `stk` at the end keeps the caller's view of
-    # the stack exactly as long as it was.
-    mem = bytearray(bytes(stk) + bytes(8))
+class Space:
+    """The guest's memory: an address space with two regions mapped.
+
+    Guest addresses are host addresses on the other side of this file too, so
+    the model has to be a map and not a buffer. The image sits at its preferred
+    base, which is what makes `lea rax, [rip+d]` hand out a pointer that is
+    still valid when it comes back as `[rax+8]`; the arena is where the harness
+    points every other register.
+    """
+
+    def __init__(self, image=None):
+        self.image = image
+        self.arena = bytearray(ARENA_SIZE)
+
+    def _at(self, addr, size):
+        if addr + size > MASK64 + 1:
+            raise Refused("address wraps")
+        if IMAGE_BASE <= addr and addr + size <= IMAGE_BASE + IMAGE_SIZE:
+            if self.image is None:
+                raise Refused("image not mapped")
+            return self.image, addr - IMAGE_BASE
+        if ARENA <= addr and addr + size <= ARENA + ARENA_SIZE:
+            return self.arena, addr - ARENA
+        raise Refused(f"outside the mapped regions ({addr:#x})")
+
+    def read(self, addr, size):
+        buf, off = self._at(addr, size)
+        return bytes(buf[off:off + size])
+
+    def write(self, addr, size, value):
+        buf, off = self._at(addr, size)
+        buf[off:off + size] = (value & ((1 << (size * 8)) - 1)).to_bytes(size, "little")
+
+
+def interpret(code, base_rva, regs, space=None):
+    """Run a function's bytes in a model of its address space.
+
+    Written from the instruction semantics rather than from the emitter, so that
+    a disagreement between the two is a bug in one of them and not a shared
+    misunderstanding. Control flow is not modelled here — `diff.py` is the
+    checker that runs the hardware — so the input is a straight-line body.
+    """
+    if space is None:
+        space = Space()
     for insn in MD.disasm(code, base_rva):
         m = insn.mnemonic
         ops = insn.operands
 
-        def absolute(op):
-            """A `[rip + d]` operand: an offset into the image, not the stack."""
-            return insn.address + insn.size + op.mem.disp
-
         def address(op):
-            m_ = op.mem
-            at = m_.disp
-            if m_.base:
-                at += regs[SUBS[MD.reg_name(m_.base)][0]]
-            if m_.index:
-                at += regs[SUBS[MD.reg_name(m_.index)][0]] * (m_.scale or 1)
-            return at & 255
+            """The 64-bit address a memory operand names, without reaching it."""
+            mo = op.mem
+            at = mo.disp
+            if mo.base:
+                name = MD.reg_name(mo.base)
+                if name == "rip":
+                    return (IMAGE_BASE + insn.address + insn.size + mo.disp) & MASK64
+                at += regs[SUBS[name][0]]
+            if mo.index:
+                at += regs[SUBS[MD.reg_name(mo.index)][0]] * (mo.scale or 1)
+            return at & MASK64
 
         def get(op):
             if op.type == capstone.x86.X86_OP_IMM:
-                return op.imm & 0xFFFFFFFFFFFFFFFF
+                return op.imm & MASK64
             if op.type == capstone.x86.X86_OP_REG:
                 index, bits, shift = SUBS[MD.reg_name(op.reg)]
-                return (regs[index] >> shift) & ((1 << bits) - 1 if bits < 64 else 0xFFFFFFFFFFFFFFFF)
+                if bits == 64:
+                    return regs[index]
+                return (regs[index] >> shift) & ((1 << bits) - 1)
             fmt = {1: "<B", 2: "<H", 4: "<I", 8: "<Q"}[op.size]
-            if op.mem.base and MD.reg_name(op.mem.base) == "rip":
-                if image is None:
-                    raise Refused("rip without an image")
-                return struct.unpack_from(fmt, image, absolute(op))[0]
-            return struct.unpack_from(fmt, mem, address(op))[0]
+            return struct.unpack(fmt, space.read(address(op), op.size))[0]
 
         def put(op, value):
-            value &= 0xFFFFFFFFFFFFFFFF
+            value &= MASK64
             if op.type == capstone.x86.X86_OP_REG:
                 index, bits, shift = SUBS[MD.reg_name(op.reg)]
-                mask = (1 << bits) - 1 if bits < 64 else 0xFFFFFFFFFFFFFFFF
-                regs[index] = (regs[index] & ~(mask << shift)) | ((value & mask) << shift)
+                if bits == 32:
+                    # A 32-bit write zeroes the top half on x86-64.
+                    regs[index] = value & 0xFFFFFFFF
+                else:
+                    mask = (1 << bits) - 1
+                    regs[index] = ((regs[index] & ~(mask << shift))
+                                   | ((value & mask) << shift)) & MASK64
                 return
-            fmt = {1: "<B", 2: "<H", 4: "<I", 8: "<Q"}[op.size]
-            value &= (1 << (op.size * 8)) - 1
-            if op.mem.base and MD.reg_name(op.mem.base) == "rip":
-                if image is None:
-                    raise Refused("rip without an image")
-                struct.pack_into(fmt, image, absolute(op), value)
-            else:
-                struct.pack_into(fmt, mem, address(op), value)
+            space.write(address(op), op.size, value)
 
         if m in ("nop", "endbr64", "cmp", "test"):
             continue
         if m == "ret":
             break
         if m == "push":
-            regs[4] -= 8
-            struct.pack_into("<Q", mem, regs[4], get(ops[0]))
+            regs[4] = (regs[4] - 8) & MASK64
+            space.write(regs[4], 8, get(ops[0]))
             continue
         if m == "pop":
-            put(ops[0], struct.unpack_from("<Q", mem, regs[4])[0])
-            regs[4] += 8
+            put(ops[0], struct.unpack("<Q", space.read(regs[4], 8))[0])
+            regs[4] = (regs[4] + 8) & MASK64
             continue
-        if m == "mov":
+        if m in ("mov", "movabs"):
             put(ops[0], get(ops[1]))
         elif m in ("movzx", "movsx", "movsxd"):
             size = ops[1].size * 8
             v = get(ops[1]) & ((1 << size) - 1)
-            if m != "movzx":
-                if v >> (size - 1):
-                    v -= 1 << size
+            if m != "movzx" and v >> (size - 1):
+                v -= 1 << size
             put(ops[0], v)
         elif m == "lea":
-            m_ = ops[1].mem
-            if m_.base and MD.reg_name(m_.base) == "rip":
-                # The emitted C computes `img + rva`, a host pointer whose value
-                # is the preferred base plus the offset; model it the same way.
-                put(ops[0], IMAGE_BASE + absolute(ops[1]))
-            else:
-                value = m_.disp
-                if m_.base:
-                    value += regs[SUBS[MD.reg_name(m_.base)][0]]
-                if m_.index:
-                    value += regs[SUBS[MD.reg_name(m_.index)][0]] * (m_.scale or 1)
-                put(ops[0], value)
+            put(ops[0], address(ops[1]))
         elif m in ("add", "sub", "and", "or", "xor"):
             a, b = get(ops[0]), get(ops[1])
-            put(ops[0], {"add": a + b, "sub": a - b, "and": a & b, "or": a | b, "xor": a ^ b}[m])
+            put(ops[0], {"add": a + b, "sub": a - b, "and": a & b,
+                         "or": a | b, "xor": a ^ b}[m])
         elif m == "imul":
-            a, b = get(ops[0]), get(ops[-1])
-            put(ops[0], a * b)
+            put(ops[0], get(ops[0]) * get(ops[-1]))
         elif m in ("shl", "shr", "sar"):
             bits = width(ops[0])
             count = get(ops[1]) & (bits - 1)
@@ -475,7 +672,7 @@ def interpret(code, base_rva, regs, stk, image=None):
             put(ops[0], {"inc": a + 1, "dec": a - 1, "neg": -a, "not": ~a}[m])
         else:
             raise Refused(m)
-    stk[:] = mem[:len(stk)]
+    return space
 
 
 def scan(path, sample):
@@ -539,8 +736,11 @@ def main():
         return
     pe, picked = candidates(args.exe, args.limit, args.max_bytes)
     print(f"liftable subset: {len(picked)} functions (<= {args.max_bytes} bytes, no calls, no branches)")
+    picked = [(rva, code, lines) for rva, code, lines in picked
+              if reachable(code, rva) and balanced(code, rva)]
+    print(f"of those, {len(picked)} stay inside the arena")
 
-    proto = "void f%d(uint64_t *r, uint8_t *stk)"
+    proto = "void f%d(uint64_t *r)"
     body = []
     for i, (rva, code, lines) in enumerate(picked):
         body.append(f"{proto % i} {{")
@@ -548,22 +748,27 @@ def main():
             body.append(f"    {line}")
         body.append("}")
     driver = "\n".join([
-        "#include <stdint.h>",
-        "#include <stdio.h>",
-        "#include <string.h>",
-        "typedef void (*fn)(uint64_t *, uint8_t *);",
-        "static const fn table[] = {" + ", ".join(f"f{i}" for i in range(len(picked))) + "};",
+        f"#define ARENA_ADDR 0x{ARENA:x}ull",
+        f"#define ARENA_SIZE 0x{ARENA_SIZE:x}u",
+        "static uint8_t *arena;",
         "int main(int argc, char **argv) {",
         "    FILE *in = fopen(argv[1], \"rb\"), *out = fopen(argv[2], \"wb\");",
         "    if (!in || !out) return 1;",
         "    if (argc < 4 || !map_image(argv[3])) return 4;",
-        "    for (size_t n = 0; n < sizeof table / sizeof table[0]; n++) {",
-        "        uint64_t r[16]; uint8_t stk[256];",
+        "    arena = (uint8_t *)VirtualAlloc((void *)(uintptr_t)ARENA_ADDR, ARENA_SIZE,",
+        "                                    MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);",
+        "    if (!arena) return 5;",
+        "    uint32_t head[2];",
+        "    while (fread(head, sizeof head, 1, in) == 1) {",
+        "        uint64_t r[16];",
         "        if (fread(r, sizeof r, 1, in) != 1) return 2;",
-        "        if (fread(stk, sizeof stk, 1, in) != 1) return 3;",
-        "        table[n](r, stk);",
+        "        if (fread(arena, ARENA_SIZE, 1, in) != 1) return 3;",
+        "        switch (head[0]) {",
+    ] + [f"        case {rva:#x}: f{i}(r); break;" for i, (rva, _, _) in enumerate(picked)] + [
+        "        default: break;",
+        "        }",
         "        fwrite(r, sizeof r, 1, out);",
-        "        fwrite(stk, sizeof stk, 1, out);",
+        "        fwrite(arena, ARENA_SIZE, 1, out);",
         "    }",
         "    return 0;",
         "}",
@@ -583,22 +788,23 @@ def main():
     else:
         print(f"generated C: {csrc} ({len(body)} lines)")
 
-    # Inputs, then the same inputs through the interpreter.
+    # Inputs, then the same inputs through the interpreter. Every register but
+    # `rsp` points into the arena, which is what a real caller hands a function:
+    # guest pointers are host pointers, so a function that stores through its
+    # first argument works instead of faulting.
     rng = random.Random(0x5EED)
-    # Only the four argument registers are defined on entry; the rest are
-    # pointed into the scratch stack, so a function that reads `[rbp-x]`
-    # before setting rbp stays inside it instead of faulting.
-    inputs = []
-    for _ in picked:
-        regs = [STACK // 2] * 16
-        for slot in (1, 2, 8, 9):  # rcx, rdx, r8, r9
-            regs[slot] = rng.getrandbits(64)
-        inputs.append(regs)
-    stacks = [bytes(rng.getrandbits(8) for _ in range(256)) for _ in picked]
+    cases = []
+    for rva, code, _ in picked:
+        for _ in range(args.rounds):
+            regs = [ARENA + rng.randrange(0x100, 0x1000, 8) for _ in range(16)]
+            regs[4] = RSP0
+            space = bytes(rng.getrandbits(8) for _ in range(ARENA_SIZE))
+            cases.append((rva, len(code), regs, space))
     with open(os.path.join(work, "in.bin"), "wb") as f:
-        for regs, stk in zip(inputs, stacks):
+        for rva, length, regs, space in cases:
+            f.write(struct.pack("<II", rva, length))
             f.write(struct.pack("<16Q", *regs))
-            f.write(stk)
+            f.write(space)
 
     exe = os.path.join(work, "lifted.exe")
     cl = find_cl()
@@ -608,7 +814,8 @@ def main():
     env = dict(os.environ)
     env["INCLUDE"] = ";".join(include_dirs())
     env["LIB"] = ";".join(lib_dirs())
-    build = subprocess.run([cl, "/nologo", "/O1", "/std:c11", f"/Fo{work}\\", csrc, "/link", f"/OUT:{exe}"],
+    build = subprocess.run([cl, "/nologo", "/O1", "/std:c11", f"/Fo{work}\\", csrc, "/link", f"/OUT:{exe}",
+                            "/BASE:0x10000000", "/DYNAMICBASE:NO"],
                            capture_output=True, text=True, encoding="mbcs", errors="replace", env=env)
     if build.returncode != 0:
         print("compile failed:")
@@ -621,25 +828,30 @@ def main():
         return
 
     data = open(os.path.join(work, "out.bin"), "rb").read()
-    image = load_image(pe) if any("[rip" in line or "img +" in line for _, _, lines in picked for line in lines) else None
-    bad = 0
-    for i, (rva, code, _) in enumerate(picked):
-        regs = list(inputs[i])
-        stk = bytearray(stacks[i])
+    image = load_image(pe)
+    bad, checked, refused = 0, 0, 0
+    for i, (rva, length, regs, space_bytes) in enumerate(cases):
+        space = Space(image)
+        space.arena[:] = space_bytes
+        want = list(regs)
         try:
-            interpret(code, rva, regs, stk, image)
+            interpret(pe.get_data(rva, length), rva, want, space)
         except Refused as why:
-            print(f"  {rva:#x}: interpreter refused {why}")
+            refused += 1
+            if refused <= 3:
+                print(f"  {rva:#x}: interpreter refused {why}")
             continue
-        off = i * (16 * 8 + 256)
-        got = struct.unpack_from("<16Q", data, off)
-        got_stk = data[off + 128: off + 128 + 256]
-        if list(got) != regs or bytes(got_stk) != bytes(stk):
+        off = i * (128 + ARENA_SIZE)
+        got = list(struct.unpack_from("<16Q", data, off))
+        got_arena = data[off + 128: off + 128 + ARENA_SIZE]
+        checked += 1
+        if got != want or got_arena != bytes(space.arena):
             bad += 1
             if bad <= 3:
-                diff = [f"{REGS[k]}: {regs[k]:#x} != {got[k]:#x}" for k in range(16) if regs[k] != got[k]]
-                print(f"  {rva:#x}: {', '.join(diff) or 'stack differs'}")
-    print(f"checked {len(picked)} functions x {args.rounds} calls: {len(picked) - bad} agree, {bad} differ")
+                diff = [f"{REGS[k]}: {want[k]:#x} != {got[k]:#x}" for k in range(16) if want[k] != got[k]]
+                print(f"  {rva:#x}: {', '.join(diff) or 'arena differs'}")
+    print(f"emitter vs interpreter: {checked} case(s) over {len(picked)} functions: "
+          f"{checked - bad} agree, {bad} differ, {refused} refused")
 
 
 def find_cl():

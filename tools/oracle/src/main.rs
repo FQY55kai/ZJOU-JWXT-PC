@@ -3,119 +3,43 @@
 //! A port that recompiles code has to answer "is the lifted function the same
 //! function?" at scale. Every earlier project in this genre paid for the answer
 //! with a whole emulator (N64/PS2/PSP) or a whole console runtime. Here the
-//! guest is x86-64 and so is the host, so the oracle is a call: copy the bytes
-//! somewhere executable, set the sixteen registers, call, read them back.
+//! guest is x86-64 and so is the host, so the oracle is a call: set the sixteen
+//! registers, call the original bytes where the image already has them, read
+//! the registers back.
 //!
 //! Input (little endian, repeated):
-//!     u32 rva, u32 len, u64 regs[16], u8 stack[256]
+//!     u32 rva, u32 len, u64 regs[16], u8 arena[0x4000]
 //! Output, one record per input:
-//!     u64 regs[16], u8 stack[256]
+//!     u64 regs[16], u8 arena[0x4000]
 //!
-//! The stack is the guest's: `rsp` in the input record is an offset into it,
-//! and only functions whose every memory operand stays inside 256 bytes are
-//! safe to run this way (the caller filters those).
+//! Guest addresses are host addresses. The image is mapped at the base it asks
+//! for, the arena is mapped at a fixed address, and `rsp` in a record is a real
+//! pointer into that arena — so a function's stores land where they would have
+//! landed, and comparing the arena compares the memory it touched, not just the
+//! registers it left behind.
 //!
-//!     cargo run --release -- <game.exe> cases.bin out.bin
+//!     cargo build --release && ./oracle <game.exe> cases.bin out.bin
 
-use std::arch::asm;
 use std::ffi::c_void;
 use std::io::{Read, Write};
 
+use oracle_guest::run_case;
+
 const PAGE: usize = 64 * 1024;
+
+/// The arena, at a fixed address both sides agree on: below the Win64 user
+/// limit (0x7FFF_FFFF_FFFF) and far from the image at 0x1_4000_0000, so a wild
+/// displacement faults instead of quietly landing in the other region.
+const ARENA: usize = 0x20_0000_0000;
+const ARENA_SIZE: usize = 0x4000;
+const RECORD: usize = 8 + 16 * 8 + ARENA_SIZE;
 
 #[link(name = "kernel32")]
 extern "system" {
     fn VirtualAlloc(at: *const c_void, size: usize, kind: u32, protect: u32) -> *mut c_void;
     fn VirtualFree(at: *mut c_void, size: usize, kind: u32) -> i32;
-}
-
-static mut REGS: *mut u64 = std::ptr::null_mut();
-static mut STK: *mut u8 = std::ptr::null_mut();
-static mut CODE: *const u8 = std::ptr::null();
-
-static mut HOST_RSP: u64 = 0;
-static mut SAVE_RBX: u64 = 0;
-static mut SAVE_RBP: u64 = 0;
-static mut GUEST_RSP: u64 = 0;
-static mut OUT: [u64; 16] = [0; 16];
-
-/// Calls `CODE` with the sixteen registers in `REGS` and the stack in `STK`,
-/// then writes what they hold afterwards back into `REGS`.
-///
-/// The guest is the same ABI as the host, so it preserves rbx/rbp/rsi/rdi and
-/// r12-r15 by itself: only the caller-saved half needs care, and the stores use
-/// rip-relative targets so that no scratch register is needed to keep them.
-#[inline(never)]
-unsafe fn call_guest() {
-    asm!(
-        // Host stack, to come back to; rbx and rbp cannot be declared as
-        // clobbers (LLVM reserves them), so they are saved by hand.
-        "mov [rip + {host}], rsp",
-        "mov [rip + {srbx}], rbx",
-        "mov [rip + {srbp}], rbp",
-        // Guest stack: the stack buffer plus the offset the record gives.
-        "mov rax, [rip + {regs}]",
-        "mov rax, [rax + 32]",
-        "add rax, [rip + {stk}]",
-        "mov [rip + {guest}], rax",
-        // All sixteen, each through the static so no register is a middleman.
-        "mov rax, [rip + {regs}]", "mov rax, [rax + 0]",
-        "mov rcx, [rip + {regs}]", "mov rcx, [rcx + 8]",
-        "mov rdx, [rip + {regs}]", "mov rdx, [rdx + 16]",
-        "mov rbx, [rip + {regs}]", "mov rbx, [rbx + 24]",
-        "mov rbp, [rip + {regs}]", "mov rbp, [rbp + 40]",
-        "mov rsi, [rip + {regs}]", "mov rsi, [rsi + 48]",
-        "mov rdi, [rip + {regs}]", "mov rdi, [rdi + 56]",
-        "mov r8,  [rip + {regs}]", "mov r8,  [r8 + 64]",
-        "mov r9,  [rip + {regs}]", "mov r9,  [r9 + 72]",
-        "mov r10, [rip + {regs}]", "mov r10, [r10 + 80]",
-        "mov r11, [rip + {regs}]", "mov r11, [r11 + 88]",
-        "mov r12, [rip + {regs}]", "mov r12, [r12 + 96]",
-        "mov r13, [rip + {regs}]", "mov r13, [r13 + 104]",
-        "mov r14, [rip + {regs}]", "mov r14, [r14 + 112]",
-        "mov r15, [rip + {regs}]", "mov r15, [r15 + 120]",
-        "mov rsp, [rip + {guest}]",
-        "call [rip + {code}]",
-        // Straight after the call: the guest's own rsp, then every register
-        // into the static array (rip-relative stores need no scratch).
-        "mov [rip + {out} + 32], rsp",
-        "mov [rip + {out} + 0], rax",
-        "mov [rip + {out} + 8], rcx",
-        "mov [rip + {out} + 16], rdx",
-        "mov [rip + {out} + 24], rbx",
-        "mov [rip + {out} + 40], rbp",
-        "mov [rip + {out} + 48], rsi",
-        "mov [rip + {out} + 56], rdi",
-        "mov [rip + {out} + 64], r8",
-        "mov [rip + {out} + 72], r9",
-        "mov [rip + {out} + 80], r10",
-        "mov [rip + {out} + 88], r11",
-        "mov [rip + {out} + 96], r12",
-        "mov [rip + {out} + 104], r13",
-        "mov [rip + {out} + 112], r14",
-        "mov [rip + {out} + 120], r15",
-        "mov rbx, [rip + {srbx}]",
-        "mov rbp, [rip + {srbp}]",
-        "mov rsp, [rip + {host}]",
-        host = sym HOST_RSP,
-        srbx = sym SAVE_RBX,
-        srbp = sym SAVE_RBP,
-        guest = sym GUEST_RSP,
-        regs = sym REGS,
-        stk = sym STK,
-        code = sym CODE,
-        out = sym OUT,
-        // The guest owns all sixteen; the Win64 clobber list covers the
-        // volatile half, and these cover the rest. Without them the compiler is
-        // free to keep a local in rbx/rbp and find it gone on return.
-        out("rsi") _,
-        out("rdi") _,
-        out("r12") _,
-        out("r13") _,
-        out("r14") _,
-        out("r15") _,
-        clobber_abi("win64"),
-    );
+    fn LoadLibraryA(name: *const u8) -> *mut c_void;
+    fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
 }
 
 /// Calls a stub written here (`mov rax, rcx; add rax, rdx; ret`) so that a
@@ -126,47 +50,23 @@ fn selftest() {
         assert!(!page.is_null());
         let code = [0x48u8, 0x89, 0xC8, 0x48, 0x01, 0xD0, 0xC3]; // mov rax,rcx; add rax,rdx; ret
         std::ptr::copy_nonoverlapping(code.as_ptr(), page, code.len());
+        map_arena();
         let mut regs = [0u64; 16];
         regs[1] = 7; // rcx
         regs[2] = 35; // rdx
-        regs[4] = STACK_OFF;
-        let mut stk = Aligned([0u8; 256]);
-        REGS = regs.as_mut_ptr();
-        STK = stk.0.as_mut_ptr();
-        CODE = page;
-        call_guest();
-        println!("selftest rax = {} (want 42), rsp offset = {}", OUT[0], OUT[4].wrapping_sub(stk.0.as_ptr() as u64));
+        regs[4] = ARENA as u64 + 0x3000;
+        let out = run_case(&mut regs, page);
+        println!("selftest rax = {} (want 42), guest rsp {:#x} -> {:#x} (call pushed, ret popped: {})",
+                 out[0], regs[4], out[4] - 8, out[4] - 8 == regs[4]);
     }
 }
 
-const STACK_OFF: u64 = 128;
-
-#[repr(align(16))]
-struct Aligned([u8; 256]);
-
-/// RVA to file offset: a virtual address is not a file position, and the
-/// difference is the whole of a section's raw data versus its image size.
-fn rva_to_offset(image: &[u8], rva: usize) -> Option<usize> {
-    let at = u32::from_le_bytes(image.get(0x3c..0x40)?.try_into().ok()?) as usize;
-    let sections = u16::from_le_bytes(image.get(at + 6..at + 8)?.try_into().ok()?) as usize;
-    let optional = u16::from_le_bytes(image.get(at + 20..at + 22)?.try_into().ok()?) as usize;
-    let table = at + 24 + optional;
-    for i in 0..sections {
-        let entry = image.get(table + i * 40..table + i * 40 + 40)?;
-        let virtual_size = u32::from_le_bytes(entry[8..12].try_into().ok()?) as usize;
-        let virtual_address = u32::from_le_bytes(entry[12..16].try_into().ok()?) as usize;
-        let raw_size = u32::from_le_bytes(entry[16..20].try_into().ok()?) as usize;
-        let raw_pointer = u32::from_le_bytes(entry[20..24].try_into().ok()?) as usize;
-        let span = virtual_size.max(raw_size);
-        if rva >= virtual_address && rva < virtual_address + span {
-            let into = rva - virtual_address;
-            if into >= raw_size {
-                return None; // uninitialised data: nothing to run
-            }
-            return Some(raw_pointer + into);
-        }
+fn map_arena() -> *mut u8 {
+    unsafe {
+        let got = VirtualAlloc(ARENA as *const c_void, ARENA_SIZE, 0x3000, 0x40);
+        assert_eq!(got as usize, ARENA, "the arena's address is taken");
+        got as *mut u8
     }
-    None
 }
 
 /// Maps the image at the base it asks for, section by section.
@@ -205,6 +105,53 @@ fn map_image(image: &[u8]) -> (*mut u8, usize) {
     }
 }
 
+/// Resolve the import table in the mapped image.
+///
+/// The file's IAT holds a hint/name pair per import, not an address — the
+/// loader writes the addresses. Without this every `jmp [__imp_Foo]` in the
+/// original code jumps into a string and runs whatever the bytes say, which is
+/// the same non-answer on both sides only by accident. A recompiled binary
+/// needs this for the same reason a loader does.
+unsafe fn fix_imports(base: usize, image: &[u8]) {
+    let at = u32::from_le_bytes(image[0x3c..0x40].try_into().unwrap()) as usize;
+    let opt = at + 24;
+    let dirs = opt + 112; // PE32+: the data directories follow the optional header
+    let import = dirs + 8;
+    let table = u32::from_le_bytes(image[import..import + 4].try_into().unwrap()) as usize;
+    if table == 0 {
+        return;
+    }
+    let mut descriptor = table;
+    loop {
+        let d = &image[descriptor..descriptor + 20];
+        let name = u32::from_le_bytes(d[12..16].try_into().unwrap()) as usize;
+        let first = u32::from_le_bytes(d[16..20].try_into().unwrap()) as usize;
+        let original = u32::from_le_bytes(d[0..4].try_into().unwrap()) as usize;
+        if name == 0 || first == 0 {
+            break;
+        }
+        let module = LoadLibraryA(image.as_ptr().add(name));
+        if !module.is_null() {
+            let source = if original != 0 { original } else { first };
+            for i in 0.. {
+                let slot = source + i * 8;
+                let thunk = u64::from_le_bytes(image[slot..slot + 8].try_into().unwrap());
+                if thunk == 0 {
+                    break;
+                }
+                let fn_at = if thunk >> 63 != 0 {
+                    GetProcAddress(module, (thunk & 0xFFFF) as *const u8)
+                } else {
+                    GetProcAddress(module, image.as_ptr().add(thunk as usize + 2))
+                };
+                let into = (base + first + i * 8) as *mut u64;
+                *into = fn_at as u64;
+            }
+        }
+        descriptor += 20;
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).is_some_and(|a| a == "--selftest") {
@@ -221,51 +168,43 @@ fn main() {
         .expect("cases")
         .read_to_end(&mut cases)
         .expect("cases");
-    let mut out = Vec::with_capacity(cases.len());
+    let mut out = Vec::with_capacity(cases.len() / RECORD * (128 + ARENA_SIZE));
 
     let (mapped, image_size) = map_image(&image);
+    unsafe { fix_imports(mapped as usize, &image) };
+    let arena = map_arena();
 
     let mut at = 0usize;
     let mut ran = 0u32;
-    while at + 8 + 16 * 8 + 256 <= cases.len() {
+    while at + RECORD <= cases.len() {
         let rva = u32::from_le_bytes(cases[at..at + 4].try_into().unwrap()) as usize;
         let len = u32::from_le_bytes(cases[at + 4..at + 8].try_into().unwrap()) as usize;
-        at += 8;
         let mut regs = [0u64; 16];
         for (i, slot) in regs.iter_mut().enumerate() {
-            *slot = u64::from_le_bytes(cases[at + i * 8..at + i * 8 + 8].try_into().unwrap());
+            let from = at + 8 + i * 8;
+            *slot = u64::from_le_bytes(cases[from..from + 8].try_into().unwrap());
         }
-        at += 128;
-        let stack = &cases[at..at + 256];
-        at += 256;
+        let arena_at = at + 8 + 128;
+        at += RECORD;
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(cases.as_ptr().add(arena_at), arena, ARENA_SIZE);
+        }
 
         if len == 0 || rva + len > image_size {
             out.extend_from_slice(&regs.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>());
-            out.extend_from_slice(stack);
+            out.extend_from_slice(&cases[arena_at..arena_at + ARENA_SIZE]);
             continue;
         }
 
-        unsafe {
-            // Bytes go in at the page's start; RIP-relative operands would
-            // resolve against the wrong base, which is why the caller filters
-            // them out before sending a case here.
-            let mut ours = regs;
-            let mut stk = Aligned([0u8; 256]);
-            stk.0.copy_from_slice(stack);
-            REGS = ours.as_mut_ptr();
-            STK = stk.0.as_mut_ptr();
-            CODE = (mapped as usize + rva) as *const u8;
-            call_guest();
-            let mut back = [0u64; 16];
-            back.copy_from_slice(&OUT);
-            // `rsp` comes back as an address into our buffer: report it the way
-            // the record asked for it, as an offset.
-            let base = stk.0.as_ptr() as u64;
-            back[4] = back[4].wrapping_sub(base);
-            out.extend_from_slice(&back.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>());
-            out.extend_from_slice(&stk.0);
-            ran += 1;
-        }
+        let mut back = run_case(&mut regs, (mapped as usize + rva) as *const u8);
+        // The `ret` popped the return address the `call` pushed, so the guest's
+        // own `rsp` is this minus eight. Report it where the lifted C will be,
+        // which is the point before the call.
+        back[4] = back[4].wrapping_sub(8);
+        out.extend_from_slice(&back.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>());
+        unsafe { out.extend_from_slice(std::slice::from_raw_parts(arena, ARENA_SIZE)) };
+        ran += 1;
     }
     unsafe { VirtualFree(mapped as *mut c_void, 0, 0x8000) };
     std::fs::File::create(&args[3])
