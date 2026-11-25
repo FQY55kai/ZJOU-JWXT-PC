@@ -8,9 +8,9 @@
 //! the registers back.
 //!
 //! Input (little endian, repeated):
-//!     u32 rva, u32 len, u64 regs[16], u8 arena[0x4000]
+//!     u32 rva, u32 len, u64 regs[16], u8 arena[0x4000], u64 vec[64]
 //! Output, one record per input:
-//!     u64 regs[16], u8 arena[0x4000]
+//!     u64 regs[16], u8 arena[0x4000], u64 vec[64]
 //!
 //! Guest addresses are host addresses. The image is mapped at the base it asks
 //! for, the arena is mapped at a fixed address, and `rsp` in a record is a real
@@ -32,7 +32,9 @@ const PAGE: usize = 64 * 1024;
 /// displacement faults instead of quietly landing in the other region.
 const ARENA: usize = 0x20_0000_0000;
 const ARENA_SIZE: usize = 0x4000;
-const RECORD: usize = 8 + 16 * 8 + ARENA_SIZE;
+/// Sixteen 256-bit vector registers, four 64-bit lanes each.
+const VEC_BYTES: usize = 16 * 32;
+const RECORD: usize = 8 + 16 * 8 + ARENA_SIZE + VEC_BYTES;
 
 #[link(name = "kernel32")]
 extern "system" {
@@ -40,7 +42,40 @@ extern "system" {
     fn VirtualFree(at: *mut c_void, size: usize, kind: u32) -> i32;
     fn LoadLibraryA(name: *const u8) -> *mut c_void;
     fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
+    fn AddVectoredExceptionHandler(first: u32, f: extern "system" fn(*mut c_void) -> i32) -> *mut c_void;
 }
+
+extern "C" {
+    #[link_name = "_setjmp"]
+    fn setjmp(buf: *mut c_void) -> i32;
+    fn longjmp(buf: *mut c_void, value: i32) -> !;
+}
+
+/// One case's fault is that case's own business.
+///
+/// Half the functions in this image read a global the file leaves zero, so
+/// `mov rax, [rip+G]; mov ecx, [rax+0xBF4]` is an access violation before any
+/// translation is involved. Without this the whole batch dies with the first
+/// one, and the driver has to bisect — six re-runs per offending case, each one
+/// mapping a 176 MB image again. That turned a two-minute comparison into a
+/// fifteen-minute one, which is its own kind of wrong answer.
+///
+/// `_JUMP_BUFFER` on x64 is 256 bytes and `setjmp`/`longjmp` are the CRT's own;
+/// the handler runs on the guest's stack, but `longjmp` restores rsp and rip
+/// from the buffer, which was filled on the host's.
+static mut JUMP: [u64; 32] = [0; 32];
+static mut ARMED: bool = false;
+
+extern "system" fn on_fault(_info: *mut c_void) -> i32 {
+    unsafe {
+        if !ARMED {
+            return 0; // EXCEPTION_CONTINUE_SEARCH: not ours, let it crash
+        }
+        ARMED = false;
+        longjmp(std::ptr::addr_of_mut!(JUMP) as *mut c_void, 1);
+    }
+}
+
 
 /// Calls a stub written here (`mov rax, rcx; add rax, rdx; ret`) so that a
 /// fault in the harness is told apart from a fault in the guest.
@@ -55,9 +90,11 @@ fn selftest() {
         regs[1] = 7; // rcx
         regs[2] = 35; // rdx
         regs[4] = ARENA as u64 + 0x3000;
-        let out = run_case(&mut regs, page);
-        println!("selftest rax = {} (want 42), guest rsp {:#x} -> {:#x} (call pushed, ret popped: {})",
-                 out[0], regs[4], out[4] - 8, out[4] - 8 == regs[4]);
+        let mut vec = [0u64; 64];
+        vec[0] = 0x3FF0_0000_0000_0000; // 1.0 in xmm0's low lane
+        let out = run_case(&mut regs, &mut vec, page);
+        println!("selftest rax = {} (want 42), xmm0 {:#x} (want unchanged), guest rsp {:#x} -> {:#x} (call pushed, ret popped: {})",
+                 out[0], vec[0], regs[4], out[4] - 8, out[4] - 8 == regs[4]);
     }
 }
 
@@ -168,7 +205,8 @@ fn main() {
         .expect("cases")
         .read_to_end(&mut cases)
         .expect("cases");
-    let mut out = Vec::with_capacity(cases.len() / RECORD * (128 + ARENA_SIZE));
+    let mut out = Vec::with_capacity(cases.len() / RECORD * (128 + ARENA_SIZE + VEC_BYTES + 4));
+    unsafe { AddVectoredExceptionHandler(1, on_fault) };
 
     let (mapped, image_size) = map_image(&image);
     unsafe { fix_imports(mapped as usize, &image) };
@@ -185,26 +223,52 @@ fn main() {
             *slot = u64::from_le_bytes(cases[from..from + 8].try_into().unwrap());
         }
         let arena_at = at + 8 + 128;
+        let vec_at = arena_at + ARENA_SIZE;
+        let mut vec = [0u64; 64];
+        for (i, slot) in vec.iter_mut().enumerate() {
+            let from = vec_at + i * 8;
+            *slot = u64::from_le_bytes(cases[from..from + 8].try_into().unwrap());
+        }
         at += RECORD;
 
         unsafe {
             std::ptr::copy_nonoverlapping(cases.as_ptr().add(arena_at), arena, ARENA_SIZE);
         }
 
-        if len == 0 || rva + len > image_size {
+        let mut landed = false;
+        if len != 0 && rva + len <= image_size {
+            let mut back = [0u64; 16];
+            let faulted = unsafe {
+                ARMED = true;
+                if setjmp(std::ptr::addr_of_mut!(JUMP) as *mut c_void) == 0 {
+                    back = run_case(&mut regs, &mut vec, (mapped as usize + rva) as *const u8);
+                    ARMED = false;
+                    false
+                } else {
+                    true
+                }
+            };
+            if !faulted {
+                // The `ret` popped the return address the `call` pushed, so the
+                // guest's own `rsp` is this minus eight. Report it where the
+                // lifted C will be, which is the point before the call.
+                back[4] = back[4].wrapping_sub(8);
+                out.extend_from_slice(&back.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>());
+                unsafe { out.extend_from_slice(std::slice::from_raw_parts(arena, ARENA_SIZE)) };
+                out.extend_from_slice(&vec.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>());
+                out.extend_from_slice(&1u32.to_le_bytes());
+                ran += 1;
+                landed = true;
+            }
+        }
+        if !landed {
+            // Faulted, or not a real function: a record either way, so the
+            // driver's records line up with its cases one to one.
             out.extend_from_slice(&regs.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>());
             out.extend_from_slice(&cases[arena_at..arena_at + ARENA_SIZE]);
-            continue;
+            out.extend_from_slice(&cases[vec_at..vec_at + VEC_BYTES]);
+            out.extend_from_slice(&0u32.to_le_bytes());
         }
-
-        let mut back = run_case(&mut regs, (mapped as usize + rva) as *const u8);
-        // The `ret` popped the return address the `call` pushed, so the guest's
-        // own `rsp` is this minus eight. Report it where the lifted C will be,
-        // which is the point before the call.
-        back[4] = back[4].wrapping_sub(8);
-        out.extend_from_slice(&back.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>());
-        unsafe { out.extend_from_slice(std::slice::from_raw_parts(arena, ARENA_SIZE)) };
-        ran += 1;
     }
     unsafe { VirtualFree(mapped as *mut c_void, 0, 0x8000) };
     std::fs::File::create(&args[3])

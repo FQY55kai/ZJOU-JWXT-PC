@@ -129,27 +129,37 @@ def width(op):
     raise Refused("width of an immediate")
 
 
-def mem(op, bits=64, insn=None):
-    """A memory operand as a real host address.
+def addr(op, insn=None):
+    """The 64-bit address a memory operand names, as a C expression.
 
-    Guest pointers are host pointers: the image is mapped at its preferred base
-    and the heap is the host's, so `mov [rcx], rax` is a store where rcx points,
-    with nothing in between. An earlier version addressed a 256-byte scratch
-    buffer by taking the low byte of the address, which is only right when the
-    address happens to be near that buffer — and rules out every function that
-    writes through an argument, which is most of them.
-
-    `[rip + d]` is not a pointer to compute: it is a fixed place in the image,
-    known at lift time, so it becomes `img + rva`.
+    Split out of `mem` because a 128-bit operand is not a `uint128_t` in C: it
+    is sixteen bytes at an address, moved with `memcpy`. The address is the
+    only thing the two uses have in common.
     """
     if op.type != capstone.x86.X86_OP_MEM:
         raise Refused("not memory")
     m = op.mem
-    if m.segment != 0:
-        raise Refused("segment")
-    if m.base and MD.reg_name(m.base) == "rip":
-        return f"*(uint{bits}_t *)(img + {rip_target(insn, m.disp):#x})"
     terms = []
+    if m.segment != 0:
+        # Every segment override in this image is the same instruction:
+        # `mov rax, gs:[0x58]`, the TLS array pointer in the TEB. Guest and host
+        # are one process, so the TEB the original bytes see is the TEB this C
+        # sees — `gs:[d]` is `*(T*)(teb + d)` with no translation in between.
+        # `(uint64_t)__readgsqword(0x30)` is the TEB's own Self field, and on
+        # x64 the GS base *is* the TEB address, so it is the base and not a
+        # pointer to it. A standalone build has to establish that base itself;
+        # that is loader work, and it is the same class of assumption as mapping
+        # the image at its preferred address.
+        seg = MD.reg_name(m.segment)
+        if seg != "gs":
+            raise Refused(f"segment {seg}")
+        if m.base and MD.reg_name(m.base) == "rip":
+            raise Refused("rip relative with a segment")
+        terms.append("(uint64_t)__readgsqword(0x30)")
+    if m.base and MD.reg_name(m.base) == "rip":
+        # `[rip + d]` is not a pointer to compute: it is a fixed place in the
+        # image, known at lift time, so it becomes `img + rva`.
+        return f"(uint64_t)(img + {rip_target(insn, m.disp):#x})"
     if m.base:
         base = MD.reg_name(m.base)
         if base not in SUBS:
@@ -162,8 +172,20 @@ def mem(op, bits=64, insn=None):
         terms.append(f"r[{SUBS[index][0]}] * {m.scale or 1}")
     if m.disp:
         terms.append(str(m.disp))
-    inner = " + ".join(terms) if terms else "0"
-    return f"*(uint{bits}_t *)(uintptr_t)({inner})"
+    return "(" + (" + ".join(terms) if terms else "0") + ")"
+
+
+def mem(op, bits=64, insn=None):
+    """A memory operand as a real host address.
+
+    Guest pointers are host pointers: the image is mapped at its preferred base
+    and the heap is the host's, so `mov [rcx], rax` is a store where rcx points,
+    with nothing in between. An earlier version addressed a 256-byte scratch
+    buffer by taking the low byte of the address, which is only right when the
+    address happens to be near that buffer — and rules out every function that
+    writes through an argument, which is most of them.
+    """
+    return f"*(uint{bits}_t *)(uintptr_t){addr(op, insn)}"
 
 
 def rip_target(insn, disp):
@@ -215,6 +237,284 @@ def wr(op, expr, insn=None):
     return f"{mem(op, op.size * 8, insn)} = {expr};"
 
 
+# --- the vector register file ------------------------------------------------
+#
+# Sixteen 256-bit registers, held as four 64-bit lanes each and moved with
+# `memcpy` at the operand's own width, because that is what the instruction is:
+# a byte copy, not a number. Nothing here is an `<immintrin.h>` type on purpose —
+# the state has to be a byte image that both sides of the differential harness
+# can be handed, and a `__m256` in a global is that image with a type on it that
+# the C standard says may not be aliased.
+#
+# A VEX-encoded 128-bit form zeroes bits 255:128 of its destination, and that is
+# modelled rather than ignored: the same register can be read as 256 bits later
+# in the same function.
+
+VEC = {}
+for _i in range(16):
+    VEC[f"xmm{_i}"] = (_i, 16)
+    VEC[f"ymm{_i}"] = (_i, 32)
+del _i
+
+VEC_MOVE = {"movaps", "movups", "movapd", "movupd", "movdqa", "movdqu", "lddqu"}
+
+# Bitwise, three operands under VEX and two under SSE. `-` stands for "and not",
+# which is `~a & b` and is not a subtraction.
+VEC_LOGIC = {
+    "xorps": "^", "xorpd": "^", "pxor": "^",
+    "andps": "&", "andpd": "&", "pand": "&",
+    "orps": "|", "orpd": "|", "por": "|",
+    "andnps": "-", "andnpd": "-", "pandn": "-",
+}
+
+# Packed and scalar float arithmetic, in the width of the lane. `max`/`min` are
+# ternaries and not `fmaxf`/`fminf`: the SSE instruction returns its *second*
+# operand when either side is NaN, and the C functions return the other one.
+VEC_FLOAT = {
+    "addps": ("+", True), "subps": ("-", True), "mulps": ("*", True),
+    "divps": ("/", True), "maxps": ("MAX", True), "minps": ("MIN", True),
+    "addpd": ("+", True), "subpd": ("-", True), "mulpd": ("*", True),
+    "divpd": ("/", True), "maxpd": ("MAX", True), "minpd": ("MIN", True),
+    "addss": ("+", False), "subss": ("-", False), "mulss": ("*", False),
+    "divss": ("/", False), "maxss": ("MAX", False), "minss": ("MIN", False),
+    "addsd": ("+", False), "subsd": ("-", False), "mulsd": ("*", False),
+    "divsd": ("/", False), "maxsd": ("MAX", False), "minsd": ("MIN", False),
+}
+
+# Broadcast: one element in, every lane out. The number is the element size.
+VEC_BROADCAST = {
+    "broadcastss": 4, "broadcastsd": 8, "pbroadcastb": 1, "pbroadcastw": 2,
+    "pbroadcastd": 4, "pbroadcastq": 8,
+}
+
+
+def vec(op):
+    """(index, bytes) for a vector register operand."""
+    if op.type != capstone.x86.X86_OP_REG:
+        raise Refused("not a vector register")
+    name = MD.reg_name(op.reg)
+    if name in VEC:
+        return VEC[name]
+    raise Refused(name)
+
+
+def is_vec(op):
+    return op.type == capstone.x86.X86_OP_REG and MD.reg_name(op.reg) in VEC
+
+
+def lane(index):
+    return f"&v[{index}][0]"
+
+
+def lane_at(op, n, insn):
+    """Lane `n` of a 64-bit-lane view of an operand, as a C expression."""
+    if op.type == capstone.x86.X86_OP_MEM:
+        return f"(*(const uint64_t *)(uintptr_t)({addr(op, insn)} + {8 * n}))"
+    index, _ = vec(op)
+    return f"v[{index}][{n}]"
+
+
+def upper_zeroed(index):
+    """The bits a VEX-encoded 128-bit form clears."""
+    return [f"v[{index}][2] = 0;", f"v[{index}][3] = 0;"]
+
+
+def element(op, n, ctype, step, insn):
+    """The `n`th element of an operand, typed, as a C expression."""
+    if op.type == capstone.x86.X86_OP_MEM:
+        return f"*(const {ctype} *)(uintptr_t)({addr(op, insn)} + {step * n})"
+    return f"*(const {ctype} *)((const char *){lane(vec(op)[0])} + {step * n})"
+
+
+# The scalar float comparisons. They write only the flags — no register, no
+# memory — so the state they change lives in `branch.py`, which is where the
+# flags are tracked. Listed here so `lift_one` does not refuse them.
+FLOAT_COMPARE = {"ucomiss": 4, "ucomisd": 8, "comiss": 4, "comisd": 8,
+                 "vucomiss": 4, "vucomisd": 8, "vcomiss": 4, "vcomisd": 8}
+
+
+def float_operand(op, size, insn):
+    """The scalar float an operand names, as a C expression."""
+    ctype = "float" if size == 4 else "double"
+    if op.type == capstone.x86.X86_OP_MEM:
+        return f"(*(const {ctype} *)(uintptr_t){addr(op, insn)})"
+    return f"(*(const {ctype} *){lane(vec(op)[0])})"
+
+
+def vec_line(insn):
+    """C statements for a vector instruction, or None if it is not one."""
+    m = insn.mnemonic
+    ops = insn.operands
+    if m in ("vzeroupper", "vzeroall"):
+        # Bits 255:128 of every register, cleared. Readable later in the same
+        # function, so it is emitted rather than skipped.
+        return [f"v[{i}][2] = v[{i}][3] = 0;" for i in range(16)]
+    if not ops:
+        return None
+    vex = m.startswith("v")
+    stem = m[1:] if vex else m
+
+    if stem in VEC_MOVE and len(ops) == 2:
+        # A byte copy at the register's width. `movaps` and `movups` differ only
+        # in whether the address must be aligned, and nothing here is modelled
+        # as an address that could fail to be, so both are `memcpy`.
+        dst, source = ops[0], ops[1]
+        if is_vec(dst):
+            index, size = vec(dst)
+            if is_vec(source):
+                lines = [f"memcpy({lane(index)}, {lane(vec(source)[0])}, {size});"]
+            else:
+                lines = [f"memcpy({lane(index)}, (const void *)(uintptr_t)"
+                         f"{addr(source, insn)}, {size});"]
+            if size == 16 and vex:
+                lines += upper_zeroed(index)
+            return lines
+        if is_vec(source):
+            index, size = vec(source)
+            return [f"memcpy((void *)(uintptr_t){addr(dst, insn)}, {lane(index)}, {size});"]
+        raise Refused(f"{m} form")
+
+    if stem in ("movss", "movsd"):
+        size = 4 if stem == "movss" else 8
+        keep = ONES[size * 8]
+        if not is_vec(ops[0]):
+            if len(ops) != 2 or not is_vec(ops[1]) or ops[0].type != capstone.x86.X86_OP_MEM:
+                raise Refused(f"{m} store")
+            index, _ = vec(ops[1])
+            return [f"*(uint{size * 8}_t *)(uintptr_t){addr(ops[0], insn)}"
+                    f" = (uint{size * 8}_t)v[{index}][0];"]
+        index, width = vec(ops[0])
+        if len(ops) == 3:
+            # VEX three-operand: the low field from src2, bits 127:32 from src1.
+            lines = [f"v[{index}][0] = ({lane_at(ops[1], 0, insn)} & ~{keep})"
+                     f" | ({lane_at(ops[2], 0, insn)} & {keep});",
+                     f"v[{index}][1] = 0;"]
+            if width == 16:
+                lines += upper_zeroed(index)
+            return lines
+        if len(ops) != 2:
+            raise Refused(f"{m} arity")
+        if ops[1].type == capstone.x86.X86_OP_MEM:
+            # A scalar load zeroes everything above the bytes it read.
+            lines = [f"v[{index}][0] = (*(const uint{size * 8}_t *)"
+                     f"(uintptr_t){addr(ops[1], insn)});", f"v[{index}][1] = 0;"]
+            if width == 16:
+                lines += upper_zeroed(index)
+            return lines
+        # A register source: under VEX only the low field survives, but the
+        # legacy encoding of the same mnemonic copies all 128 bits. The two look
+        # identical here, so the legacy one is refused rather than guessed at —
+        # `movaps` is what a compiler emits for a full copy anyway.
+        if not vex:
+            raise Refused(f"legacy {m} register")
+        other, _ = vec(ops[1])
+        lines = [f"v[{index}][0] = (v[{other}][0] & {keep});", f"v[{index}][1] = 0;"]
+        if width == 16:
+            lines += upper_zeroed(index)
+        return lines
+
+    if stem in ("movd", "movq") and len(ops) == 2:
+        if is_vec(ops[0]) and is_vec(ops[1]):
+            return [f"memcpy({lane(vec(ops[0])[0])}, {lane(vec(ops[1])[0])}, 16);"]
+        bits = 32 if stem == "movd" else 64
+        if is_vec(ops[0]):
+            index, width = vec(ops[0])
+            if ops[1].type == capstone.x86.X86_OP_MEM:
+                value = f"(*(const uint{bits}_t *)(uintptr_t){addr(ops[1], insn)})"
+            else:
+                value = src(ops[1], insn)
+            lines = [f"v[{index}][0] = {value};", f"v[{index}][1] = 0;"]
+            if width == 16:
+                lines += upper_zeroed(index)
+            return lines
+        if is_vec(ops[1]):
+            index, _ = vec(ops[1])
+            return [wr(ops[0], f"v[{index}][0]", insn)]
+        raise Refused(f"{m} form")
+
+    if stem in VEC_LOGIC:
+        if len(ops) == 3:
+            dst, a, b = ops
+        elif len(ops) == 2:
+            dst, a, b = ops[0], ops[0], ops[1]
+        else:
+            raise Refused(f"{m} arity")
+        index, width = vec(dst)
+        op = VEC_LOGIC[stem]
+        lines = []
+        for n in range(width // 8):
+            x, y = lane_at(a, n, insn), lane_at(b, n, insn)
+            expr = f"(~{x}) & {y}" if op == "-" else f"({x}) {op} ({y})"
+            lines.append(f"v[{index}][{n}] = {expr};")
+        # Each lane reads before it writes, and the lanes it has not reached are
+        # untouched, so a destination that is also a source stays correct.
+        if width == 16 and vex:
+            lines += upper_zeroed(index)
+        return lines
+
+    if stem in VEC_FLOAT:
+        op, packed = VEC_FLOAT[stem]
+        if len(ops) == 3:
+            dst, a, b = ops
+        elif len(ops) == 2:
+            dst, a, b = ops[0], ops[0], ops[1]
+        else:
+            raise Refused(f"{m} arity")
+        index, width = vec(dst)
+        ctype = "double" if stem.endswith(("sd", "pd")) else "float"
+        step = 8 if ctype == "double" else 4
+        lanes = width // step if packed else 1
+        lines = ["{"]
+        for n in range(lanes):
+            x, y = element(a, n, ctype, step, insn), element(b, n, ctype, step, insn)
+            if op == "MAX":
+                expr = f"({x} > {y} ? {x} : {y})"
+            elif op == "MIN":
+                expr = f"({x} < {y} ? {x} : {y})"
+            else:
+                expr = f"({x}) {op} ({y})"
+            lines.append(f"    {ctype} d{n} = {expr};")
+        for n in range(lanes):
+            lines.append(f"    memcpy((char *){lane(index)} + {step * n}, &d{n}, {step});")
+        if not packed:
+            # A scalar form keeps the low lane and clears the rest of the
+            # register, upper half included.
+            lines.append(f"    memset((char *){lane(index)} + {step}, 0, {width - step});")
+        elif width == 16 and vex:
+            lines += ["    " + z for z in upper_zeroed(index)]
+        lines.append("}")
+        return lines
+
+    if stem in VEC_BROADCAST:
+        size = VEC_BROADCAST[stem]
+        if len(ops) != 2:
+            raise Refused(f"{m} arity")
+        index, width = vec(ops[0])
+        source = ops[1]
+        if source.type == capstone.x86.X86_OP_MEM:
+            at = f"(const void *)(uintptr_t){addr(source, insn)}"
+        else:
+            at = f"(const void *){lane(vec(source)[0])}"
+        lines = ["{"]
+        if size == 1:
+            lines.append("    uint64_t z = (uint64_t)(*(const uint8_t *)"
+                         + at + ") * UINT64_C(0x0101010101010101);")
+        elif size == 2:
+            lines.append("    uint64_t z = (uint64_t)(*(const uint16_t *)"
+                         + at + ") * UINT64_C(0x0001000100010001);")
+        elif size == 4:
+            lines.append(f"    uint32_t e; memcpy(&e, {at}, 4);")
+            lines.append("    uint64_t z = ((uint64_t)e << 32) | e;")
+        else:
+            lines.append(f"    uint64_t z; memcpy(&z, {at}, 8);")
+        for n in range(width // 8):
+            lines.append(f"    v[{index}][{n}] = z;")
+        lines.append("}")
+        return lines
+
+    return None
+
+
 def lift_one(insn):
     """C statements for one instruction, or Refused."""
     m = insn.mnemonic
@@ -225,6 +525,13 @@ def lift_one(insn):
         raise Refused(m)
     if m == "ret":
         return ["return;"]
+    if m in FLOAT_COMPARE:
+        return []  # flags only; `branch.py` is where they are tracked
+    vector = vec_line(insn)
+    if vector is not None:
+        return vector
+    if not ops:
+        raise Refused(m)
     if m == "push":
         return ["r[4] -= 8;", f"*(uint64_t *)(uintptr_t)(r[4]) = {src(ops[0], insn)};"]
     if m == "pop":
@@ -293,6 +600,63 @@ def lift_one(insn):
         else:
             expr = f"(int{bits}_t){value} >> {count}"
         return [wr(ops[0], expr, insn)]
+    if m in ("shlx", "shrx", "sarx"):
+        # BMI2: the count is a third operand and is masked the same way, which
+        # is the whole difference from `shl`. No flags written either way.
+        if len(ops) != 3:
+            raise Refused(f"{m} arity")
+        bits = width(ops[0])
+        count = f"({src(ops[2], insn)} & {bits - 1})"
+        value = src(ops[1], insn)
+        if m == "shlx":
+            expr = f"{value} << {count}"
+        elif m == "shrx":
+            expr = f"{value} >> {count}"
+        else:
+            expr = f"(int{bits}_t){value} >> {count}"
+        return [wr(ops[0], expr, insn)]
+    if m in ("cdqe", "cdq", "cqo", "cbw", "cwde"):
+        # Sign extension into the fixed register, and the sign of rax into rdx
+        # for the two-operand `div` that usually follows.
+        if m == "cdqe":
+            return ["r[0] = (uint64_t)(int64_t)(int32_t)r[0];"]
+        if m == "cdq":
+            return ["r[2] = (uint64_t)(uint32_t)(int32_t)((int32_t)r[0] >> 31);"]
+        if m == "cqo":
+            return ["r[2] = (uint64_t)((int64_t)r[0] >> 63);"]
+        if m == "cbw":
+            return ["r[0] = (r[0] & ~UINT64_C(0xFFFF))"
+                    " | (uint64_t)(uint16_t)(int16_t)(int8_t)r[0];"]
+        return ["r[0] = (uint64_t)(uint32_t)(int32_t)(int16_t)r[0];"]
+    if m == "mulx":
+        # BMI2: RDX times the source, high half into the first operand and low
+        # into the second, with the flags left alone — which is why compilers
+        # use it for a multiply that sits between a compare and a branch.
+        if len(ops) != 3:
+            raise Refused("mulx arity")
+        bits = width(ops[0])
+        if bits == 64:
+            return ["{",
+                    f"    uint64_t lo, hi = _umul128((uint64_t){src(ops[2], insn)}, r[2], &lo);",
+                    "    " + wr(ops[1], "lo", insn),
+                    "    " + wr(ops[0], "hi", insn),
+                    "}"]
+        return ["{",
+                f"    uint64_t p = (uint64_t)(uint32_t){src(ops[2], insn)}"
+                " * (uint64_t)(uint32_t)r[2];",
+                "    " + wr(ops[1], "(uint32_t)p", insn),
+                "    " + wr(ops[0], "(uint32_t)(p >> 32)", insn),
+                "}"]
+    if m == "xchg":
+        if len(ops) != 2:
+            raise Refused("xchg arity")
+        bits = width(ops[0])
+        return ["{",
+                f"    uint{bits}_t x = (uint{bits}_t){src(ops[0], insn)};",
+                f"    uint{bits}_t y = (uint{bits}_t){src(ops[1], insn)};",
+                "    " + wr(ops[0], "y", insn),
+                "    " + wr(ops[1], "x", insn),
+                "}"]
     if m in ("inc", "dec", "neg", "not"):
         one = {"inc": "+ 1", "dec": "- 1"}.get(m)
         if one:
@@ -300,6 +664,54 @@ def lift_one(insn):
         if m == "neg":
             return [wr(ops[0], f"-(int{width(ops[0])}_t){src(ops[0], insn)}", insn)]
         return [wr(ops[0], f"~{src(ops[0], insn)}", insn)]
+    if m == "andn":
+        # BMI1: `andn dest, src1, src2` is `~src1 & src2`, three operands, and
+        # the destination takes a 32-bit write's zero-extension like any other.
+        if len(ops) != 3:
+            raise Refused("andn arity")
+        return [wr(ops[0], f"(~{src(ops[1], insn)}) & {src(ops[2], insn)}", insn)]
+    if m == "bextr":
+        # BMI1: the control operand packs a start bit and a length. A length
+        # that runs past the top takes everything left and nothing more, and a
+        # start past the top gives zero — both are the register width's doing,
+        # so the mask is clamped at 64 and the result is masked by `wr`.
+        if len(ops) != 3:
+            raise Refused("bextr arity")
+        bits = width(ops[0])
+        return [
+            "{",
+            f"    uint32_t c = (uint32_t){src(ops[2], insn)};",
+            "    uint32_t from = c & 0xFF, len = (c >> 8) & 0xFF;",
+            f"    uint64_t s = (uint64_t){src(ops[1], insn)};",
+            "    uint64_t m = len >= 64 ? ~UINT64_C(0) : ((UINT64_C(1) << len) - 1);",
+            f"    uint64_t r0 = from >= {bits} ? 0 : ((s >> from) & m);",
+            "    " + wr(ops[0], "r0", insn),
+            "}",
+        ]
+    if m in ("div", "idiv"):
+        # The one-operand form divides RDX:RAX and leaves quotient in RAX and
+        # remainder in RDX — a 128-by-64 division no C operator performs. MSVC's
+        # `_udiv128`/`_div128` intrinsics are that instruction and nothing else,
+        # so a divisor of zero or a quotient that does not fit raises the same
+        # #DE here as it does in the original. Faults are left to propagate:
+        # catching them would mean inventing behaviour the hardware does not have.
+        if len(ops) != 1:
+            raise Refused(f"{m} arity")
+        bits = ops[0].size * 8
+        if bits not in (32, 64):
+            raise Refused(f"{m} {bits}-bit")
+        signed = "u" if m == "div" else ""
+        wide = f"{signed}int64_t"
+        high = "(r[2] & 0xFFFFFFFF)" if bits == 32 else "r[2]"
+        low = "(r[0] & 0xFFFFFFFF)" if bits == 32 else "r[0]"
+        back = "(uint64_t)(uint32_t)" if bits == 32 else "(uint64_t)"
+        return [
+            "{",
+            f"    {wide} d = ({wide}){src(ops[0], insn)}, rem;",
+            f"    {wide} q = _{signed}div128({high}, {low}, d, &rem);",
+            f"    r[0] = {back}q; r[2] = {back}rem;",
+            "}",
+        ]
     if m in ("cmp", "test"):
         # Nothing in this subset reads the flags, so nothing to keep. The branch
         # pass in `branch.py` is where they start to matter.
@@ -555,6 +967,10 @@ class Space:
     def __init__(self, image=None):
         self.image = image
         self.arena = bytearray(ARENA_SIZE)
+        # The model's TEB base, made up but fixed: the interpreter's job is to
+        # disagree with the emitter when either is wrong, and a constant base
+        # reaches the same address every time.
+        self.teb = ARENA + 0x3000
 
     def _at(self, addr, size):
         if addr + size > MASK64 + 1:
@@ -594,6 +1010,10 @@ def interpret(code, base_rva, regs, space=None):
             """The 64-bit address a memory operand names, without reaching it."""
             mo = op.mem
             at = mo.disp
+            if mo.segment:
+                # The TEB, read out of the model rather than out of a register:
+                # `gs:[0x30]` is the Self field, so it *is* the base.
+                at += space.teb
             if mo.base:
                 name = MD.reg_name(mo.base)
                 if name == "rip":
@@ -670,6 +1090,34 @@ def interpret(code, base_rva, regs, space=None):
         elif m in ("inc", "dec", "neg", "not"):
             a = get(ops[0])
             put(ops[0], {"inc": a + 1, "dec": a - 1, "neg": -a, "not": ~a}[m])
+        elif m == "andn":
+            put(ops[0], ~get(ops[1]) & get(ops[2]))
+        elif m in ("div", "idiv"):
+            bits = ops[0].size * 8
+            if bits not in (32, 64):
+                raise Refused(f"{m} {bits}-bit")
+            mask = (1 << bits) - 1
+            # Read the divisor before touching rax/rdx: it may be `div rax`.
+            raw = get(ops[0]) & mask
+            if raw == 0:
+                raise Refused("divide by zero")
+            dividend = ((regs[2] & mask) << bits) | (regs[0] & mask)
+            if m == "idiv":
+                if dividend >> (2 * bits - 1):
+                    dividend -= 1 << (2 * bits)
+                divisor = raw - (1 << bits) if raw >> (bits - 1) else raw
+                q = abs(dividend) // abs(divisor)
+                if (dividend < 0) != (divisor < 0):
+                    q = -q
+                rem = dividend - q * divisor
+                if not -(1 << (bits - 1)) <= q < (1 << (bits - 1)):
+                    raise Refused("quotient overflows")
+            else:
+                q, rem = divmod(dividend, raw)
+                if q > mask:
+                    raise Refused("quotient overflows")
+            regs[0] = q & mask
+            regs[2] = rem & mask
         else:
             raise Refused(m)
     return space
@@ -721,6 +1169,17 @@ def candidates(path, limit, max_bytes):
     return pe, picked
 
 
+def uses_vector(code, rva):
+    """True when the function touches the vector file."""
+    for insn in MD.disasm(code, rva):
+        if insn.mnemonic in ("vzeroupper", "vzeroall"):
+            return True
+        for op in insn.operands:
+            if op.type == capstone.x86.X86_OP_REG and MD.reg_name(op.reg) in VEC:
+                return True
+    return False
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("exe", nargs="?", default=r"C:\Games\BaiduNetdiskDownload\GTA6.Xbox.v1.0.2.1-CYBERLEEK\game_scarlett_master.exe")
@@ -739,6 +1198,15 @@ def main():
     picked = [(rva, code, lines) for rva, code, lines in picked
               if reachable(code, rva) and balanced(code, rva)]
     print(f"of those, {len(picked)} stay inside the arena")
+    # The interpreter below models the general registers and memory, not the
+    # vector file. A function that touches xmm is therefore outside what it can
+    # check, and is skipped here rather than guessed at — `diff.py` is where
+    # those are checked, against the hardware.
+    before = len(picked)
+    picked = [(rva, code, lines) for rva, code, lines in picked
+              if not uses_vector(code, rva)]
+    print(f"of those, {len(picked)} touch no vector register "
+          f"({before - len(picked)} skipped: unmodelled here)")
 
     proto = "void f%d(uint64_t *r)"
     body = []
@@ -777,7 +1245,8 @@ def main():
 
     work = tempfile.mkdtemp(prefix="lift-")
     csrc = os.path.join(work, "lifted.c")
-    head = "#include <stdint.h>\n#include <stdio.h>\n#include <string.h>\n"
+    head = ("#include <stdint.h>\n#include <stdio.h>\n#include <string.h>\n"
+            "#include <intrin.h>\nstatic uint64_t v[16][4];\n")
     whole = head + "\n".join(image_loader(pe)) + "\n" + "\n".join(body) + "\n" + driver
     with open(csrc, "w", encoding="utf-8") as f:
         f.write(whole)

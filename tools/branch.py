@@ -46,7 +46,26 @@ EQUALITY = {"e": "==", "ne": "!="}
 # is the flag's source. CF and OF are *not* covered — after `add` they mean
 # carry and signed overflow, not the comparison the condition names — so only
 # e/ne/s/ns may read these.
-FLAG_FROM_RESULT = {"add", "sub", "and", "or", "xor", "inc", "dec", "neg"}
+FLAG_FROM_RESULT = {"add", "sub", "and", "or", "xor", "inc", "dec", "neg",
+                    "andn", "bextr"}
+
+# The vector unit's moves and bitwise ops. None of them write the arithmetic
+# flags — the ones that do (`ucomiss`, `ptest`) are not translated at all — so a
+# `cmp` in front of a spill of xmm6 is still live after it. Without this the
+# prologue of every function that touches an xmm register would invalidate the
+# compare in front of its first branch.
+VEC_FLAGLESS = {
+    "movss", "movsd", "movd", "movq", "movaps", "movups", "movapd", "movupd",
+    "movdqa", "movdqu", "lddqu", "xorps", "xorpd", "pxor", "andps", "andpd",
+    "pand", "orps", "orpd", "por", "andnps", "andnpd", "pandn",
+    "vzeroupper", "vzeroall",
+}
+
+
+def flag_neutral(mnemonic):
+    """True when the instruction leaves the arithmetic flags alone."""
+    return mnemonic in VEC_FLAGLESS or (
+        mnemonic.startswith("v") and mnemonic[1:] in VEC_FLAGLESS)
 
 # Instructions that leave the flags alone, so a compare stays live across them.
 # Everything else that is not a consumer invalidates it: a `cmp` followed by an
@@ -54,6 +73,7 @@ FLAG_FROM_RESULT = {"add", "sub", "and", "or", "xor", "inc", "dec", "neg"}
 FLAG_SAFE = {
     "mov", "movabs", "movzx", "movsx", "movsxd", "lea", "not", "bswap", "nop",
     "push", "pop", "cbw", "cwde", "cdqe", "cdq", "cqo", "xchg", "endbr64",
+    "shlx", "shrx", "sarx", "mulx",
     "sete", "setne", "sets", "setns", "seta", "setae", "setb", "setbe",
     "setg", "setge", "setl", "setle", "setc", "setnc", "seto", "setno",
     "setp", "setnp",
@@ -137,10 +157,45 @@ def condition(pending, suffix):
         if suffix == "ae":
             return "1"
         raise Refused(f"test {suffix}")
+    if kind == "fcom":
+        # `ucomiss`/`ucomisd` and their ordered twins, as the four conditions
+        # the SDM defines: unordered sets ZF=PF=CF=1, greater clears all three,
+        # less sets CF, equal sets ZF. C's relational operators are false for a
+        # NaN, which is what makes the negated forms below exactly right: `jb`
+        # is `!(a >= b)` and so is true when either side is NaN, just as CF=1
+        # is. Getting this wrong by writing `(a) < (b)` would lose every
+        # unordered case, and compilers emit this pair precisely to catch them.
+        unordered = f"(({a}) != ({a}) || ({b}) != ({b}))"
+        if suffix in ("e", "z"):
+            return f"(!(({a}) < ({b})) && !(({b}) < ({a})))"
+        if suffix in ("ne", "nz"):
+            return f"(({a}) < ({b}) || ({b}) < ({a}))"
+        if suffix == "a":
+            return f"(({a}) > ({b}))"
+        if suffix == "ae":
+            return f"(({a}) >= ({b}))"
+        if suffix == "b" or suffix == "c":
+            return f"(!(({a}) >= ({b})))"
+        if suffix == "be":
+            return f"(!(({a}) > ({b})))"
+        if suffix == "nc":
+            return f"(({a}) >= ({b}))"
+        if suffix == "p":
+            return unordered
+        if suffix == "np":
+            return f"!{unordered}"
+        raise Refused(f"float compare {suffix}")
     if suffix in EQUALITY:
         return f"(({a}) {EQUALITY[suffix]} ({b}))"
     if suffix in UNSIGNED:
-        return f"(({a}) {UNSIGNED[suffix]} ({b}))"
+        # Both sides are truncated to the operand's width first. The snapshots
+        # are 64-bit, and an immediate arrives sign-extended to 64 bits, so
+        # `cmp ecx, -2` would otherwise compare 0x00000000_FFFFFFFE against
+        # 0xFFFFFFFF_FFFFFFFE and report "below" where the hardware reports
+        # "not below" — which is exactly the boundary case the compare exists
+        # to test. Found by the differential harness on `0x2839d0`, a function
+        # whose whole job is `(x - 2) > 1`.
+        return f"((uint{bits}_t)({a}) {UNSIGNED[suffix]} (uint{bits}_t)({b}))"
     if suffix in SIGNED:
         return f"((int{bits}_t)({a}) {SIGNED[suffix]} (int{bits}_t)({b}))"
     # Overflow and parity conditions need the producer's carry chain, which this
@@ -331,6 +386,18 @@ def lift_function(code, rva):
             out.append(f"uint64_t a{snap} = {a}, b{snap} = {b};")
             pending = (m, f"a{snap}", f"b{snap}", ops[0].size * 8)
             continue
+        if m in module.FLOAT_COMPARE:
+            # The two low lanes, snapshotted as C floats: a `mov` between the
+            # compare and its branch could otherwise overwrite the register.
+            if len(ops) != 2:
+                raise Refused(f"{m} arity")
+            snap += 1
+            size = module.FLOAT_COMPARE[m]
+            ctype = "float" if size == 4 else "double"
+            out.append(f"{ctype} f{snap} = {module.float_operand(ops[0], size, insn)}"
+                       f", g{snap} = {module.float_operand(ops[1], size, insn)};")
+            pending = ("fcom", f"f{snap}", f"g{snap}", size * 8)
+            continue
         if m.startswith("j") and m != "jmp":
             if pending is None:
                 raise Refused(f"{m} without a compare")
@@ -387,7 +454,7 @@ def lift_function(code, rva):
             out.append("r[4] += 8;")
             pending = None  # a call does not preserve the flags
             continue
-        if m not in FLAG_SAFE:
+        if m not in FLAG_SAFE and not flag_neutral(m):
             pending = None
         out.extend(module.lift_one(insn))
         if m in FLAG_FROM_RESULT:

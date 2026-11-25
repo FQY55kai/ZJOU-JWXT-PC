@@ -47,13 +47,47 @@ ARENA_SIZE = lift.ARENA_SIZE
 RSP0 = lift.RSP0
 
 SLOTS = 32  # bridged call sites a function may report; more is clamped
-RECORD_IN = 8 + 16 * 8 + ARENA_SIZE
-RECORD_OUT = 16 * 8 + ARENA_SIZE + 4 + SLOTS * 8 + 4
+VEC_BYTES = 16 * 32  # sixteen 256-bit vector registers
+RECORD_IN = 8 + 16 * 8 + ARENA_SIZE + VEC_BYTES
+RECORD_OUT = 16 * 8 + ARENA_SIZE + VEC_BYTES + 4 + SLOTS * 8 + 4
 CHUNK = 64  # cases per oracle run: a fault is bisected, not paid for
 
 
 balanced = lift.balanced
 reachable = lift.reachable
+
+
+def teb_dependent(pe, rva, lifted, depth=3):
+    """True when the function, or anything it calls, reads the TEB.
+
+    `mov rax, gs:[0x58]` is the TLS array pointer, and the TEB is *per process*.
+    The oracle and the port are two processes, so that pointer names two
+    different objects and everything reachable from it — TLS blocks, and the
+    allocation state a title keeps in them — is unrelated between the sides.
+    Such a function is translated correctly and still cannot agree here, so it
+    is counted apart instead of as a disagreement: the harness's boundary, not
+    the translation's.
+
+    The walk follows `branch.CALLS`, which the CFG pass recorded for every
+    function it lifted, and reads the bytes of the ones it did not.
+    """
+    seen = set()
+    todo = [(rva, 0)]
+    while todo:
+        at, level = todo.pop()
+        if at in seen or level > depth:
+            continue
+        seen.add(at)
+        code = lifted.get(at)
+        if code is None:
+            code = pe.get_data(at, 0x200)
+        for insn in lift.MD.disasm(code, at):
+            if any(op.type == capstone.x86.X86_OP_MEM and op.mem.segment
+                   for op in insn.operands):
+                return True
+        for target in branch.CALLS.get(at, ()):
+            todo.append((target, level + 1))
+    return False
 
 
 def pick(exe, limit, max_bytes, branches, skip=0):
@@ -92,7 +126,8 @@ def emit(kept, path, pe):
     """The lifted functions, a bridge for everything else, and a driver."""
     outer = externals(kept)
     names = sorted({rva for rva, _, _ in kept} | outer)
-    lines = ["#include <stdint.h>", "#include <stdio.h>", "#include <string.h>"]
+    lines = ["#include <stdint.h>", "#include <stdio.h>", "#include <string.h>",
+             "#include <intrin.h>", "#include <setjmp.h>"]
     lines += lift.image_loader(pe)
     lines += [
         "#include <windows.h>",
@@ -100,9 +135,15 @@ def emit(kept, path, pe):
         f"#define ARENA_SIZE 0x{ARENA_SIZE:x}u",
         f"#define SLOTS {SLOTS}",
         "",
+        "// The vector register file: sixteen 256-bit registers, four lanes each.",
+        "// A global because they *are* global: a nested lifted call must see the",
+        "// same registers its caller does. Reset from the case record, so both",
+        "// sides of the comparison start from the same bytes.",
+        "static uint64_t v[16][4];",
+        "",
         "// The one slot a bridged call leaves different: the return address it",
         "// pushed, a host address here and an image address in a guest `call`.",
-        "extern void guest_bridge(uint64_t *r, const void *target);",
+        "extern void guest_bridge(uint64_t *r, uint64_t *v, const void *target);",
         "static uint64_t slots[SLOTS];",
         "static uint32_t nslots;",
         "static void note(uint64_t at) { if (nslots < SLOTS) slots[nslots++] = at; }",
@@ -121,12 +162,12 @@ def emit(kept, path, pe):
             f"void f_{rva:#x}(uint64_t *r) {{",
             "    r[4] += 8;",
             "    note(r[4] - 8);",
-            f"    guest_bridge(r, img + {rva:#x});",
+            f"    guest_bridge(r, v, img + {rva:#x});",
             "    r[4] -= 8;",
             "}",
             f"void j_{rva:#x}(uint64_t *r) {{",
             "    note(r[4] - 8);",
-            f"    guest_bridge(r, img + {rva:#x});",
+            f"    guest_bridge(r, v, img + {rva:#x});",
             "}",
         ]
     for rva, _, body in kept:
@@ -140,14 +181,18 @@ def emit(kept, path, pe):
             lines += [f"void j_{rva:#x}(uint64_t *r) {{ f_{rva:#x}(r); }}"]
     lines += [
         "static uint8_t *arena;",
+        "",
+        "// One case's fault is that case's business, including one inside the",
+        "// bridge: `__try` cannot help there, because the guest runs on the arena",
+        "// and the unwinder walks a stack that is not this thread's. A vectored",
+        "// handler plus `longjmp` does not care whose stack it is on — it restores",
+        "// rsp and rip from the buffer `setjmp` filled on the host's.",
+        "static jmp_buf jb;",
+        "static int armed;",
         "static LONG CALLBACK on_fault(EXCEPTION_POINTERS *ep) {",
-        "    CONTEXT *c = ep->ContextRecord;",
-        "    fprintf(stderr, \"fault code=%lx at=%p rip=%p rsp=%p rax=%p rcx=%p rdx=%p\",",
-        "            (unsigned long)ep->ExceptionRecord->ExceptionCode,",
-        "            ep->ExceptionRecord->ExceptionAddress,",
-        "            (void *)c->Rip, (void *)c->Rsp, (void *)c->Rax, (void *)c->Rcx, (void *)c->Rdx);",
-        "    fputc(10, stderr);",
-        "    return EXCEPTION_CONTINUE_SEARCH;",
+        "    if (!armed) return EXCEPTION_CONTINUE_SEARCH;",
+        "    armed = 0;",
+        "    longjmp(jb, 1);",
         "}",
         "int main(int argc, char **argv) {",
         "    FILE *in = fopen(argv[1], \"rb\"), *out = fopen(argv[2], \"wb\");",
@@ -162,19 +207,22 @@ def emit(kept, path, pe):
         "        uint64_t r[16];",
         "        if (fread(r, sizeof r, 1, in) != 1) return 2;",
         "        if (fread(arena, ARENA_SIZE, 1, in) != 1) return 3;",
+        "        if (fread(v, sizeof v, 1, in) != 1) return 6;",
         "        nslots = 0;",
-        "        uint32_t ran = 0;",
-        "        __try {",
+        "        uint32_t ran = 1;",
+        "        armed = 1;",
+        "        if (setjmp(jb) == 0) {",
         "        switch (head[0]) {",
     ]
     lines += [f"        case {rva:#x}: f_{rva:#x}(r); break;" for rva, _, _ in kept]
     lines += [
         "        default: break;",
         "        }",
-        "        ran = 1;",
-        "        } __except (EXCEPTION_EXECUTE_HANDLER) { ran = 0; }",
+        "        armed = 0;",
+        "        } else { ran = 0; }",
         "        fwrite(r, sizeof r, 1, out);",
         "        fwrite(arena, ARENA_SIZE, 1, out);",
+        "        fwrite(v, sizeof v, 1, out);",
         "        fwrite(&nslots, sizeof nslots, 1, out);",
         "        fwrite(slots, sizeof slots, 1, out);",
         "        fwrite(&ran, sizeof ran, 1, out);",
@@ -199,10 +247,11 @@ def isolate(launch, read, items, work, tag, limit):
     cin = os.path.join(work, tag + ".in")
     cout = os.path.join(work, tag + ".out")
     with open(cin, "wb") as f:
-        for rva, length, regs, arena in items:
+        for rva, length, regs, arena, vec in items:
             f.write(struct.pack("<II", rva, length))
             f.write(struct.pack("<16Q", *regs))
             f.write(arena)
+            f.write(struct.pack("<64Q", *vec))
     try:
         failed = subprocess.run(launch(cin, cout), capture_output=True, cwd=work,
                                 timeout=limit).returncode != 0
@@ -217,13 +266,19 @@ def isolate(launch, read, items, work, tag, limit):
 
 
 def read_hardware(path, count):
-    """Registers then arena, per case: what the original bytes did."""
+    """Registers, arena, vector registers: what the original bytes did."""
     with open(path, "rb") as f:
         data = f.read()
     got = []
+    stride = 128 + ARENA_SIZE + VEC_BYTES + 4
     for i in range(count):
-        base = i * (128 + ARENA_SIZE)
-        got.append((struct.unpack_from("<16Q", data, base), data[base + 128:base + 128 + ARENA_SIZE]))
+        base = i * stride
+        if struct.unpack_from("<I", data, base + stride - 4)[0] == 0:
+            got.append(None)  # the guest faulted on this one
+            continue
+        got.append((struct.unpack_from("<16Q", data, base),
+                    data[base + 128:base + 128 + ARENA_SIZE],
+                    data[base + 128 + ARENA_SIZE:base + stride - 4]))
     return got
 
 
@@ -232,17 +287,35 @@ def read_port(path, count):
     with open(path, "rb") as f:
         data = f.read()
     got = []
+    tail = 128 + ARENA_SIZE + VEC_BYTES
     for i in range(count):
         base = i * RECORD_OUT
-        count_slots = struct.unpack_from("<I", data, base + 128 + ARENA_SIZE)[0]
         got.append({
             "regs": struct.unpack_from("<16Q", data, base),
             "arena": data[base + 128:base + 128 + ARENA_SIZE],
-            "slots": struct.unpack_from(f"<{SLOTS}Q", data, base + 128 + ARENA_SIZE + 4),
-            "nslots": count_slots,
-            "ran": struct.unpack_from("<I", data, base + 128 + ARENA_SIZE + 4 + SLOTS * 8)[0],
+            "vec": data[base + 128 + ARENA_SIZE:base + tail],
+            "slots": struct.unpack_from(f"<{SLOTS}Q", data, base + tail + 4),
+            "nslots": struct.unpack_from("<I", data, base + tail)[0],
+            "ran": struct.unpack_from("<I", data, base + tail + 4 + SLOTS * 8)[0],
         })
     return got
+
+
+def vector_state(rng):
+    """Entry state for xmm0-xmm15: sixteen registers of normal small floats.
+
+    Not random bytes. A random 64-bit lane is a NaN or a denormal far more often
+    than not, and denormals are where hardware and a compiled expression are
+    most likely to differ for reasons that have nothing to do with the
+    translation. Every 32-bit half here is a float in [1, 2): a normal number,
+    distinct per lane, and cheap to make.
+    """
+    words = []
+    for _ in range(VEC_BYTES // 8):
+        low = 0x3F800000 | rng.getrandbits(23)
+        high = 0x3F800000 | rng.getrandbits(23)
+        words.append(low | (high << 32))
+    return words
 
 
 def self_referential(rng):
@@ -269,7 +342,7 @@ def main():
                     help="one function, for looking at a fault")
     ap.add_argument("--skip", type=int, default=0, help="start this many .pdata entries in")
     ap.add_argument("--rounds", type=int, default=4)
-    ap.add_argument("--timeout", type=int, default=120,
+    ap.add_argument("--timeout", type=int, default=5,
                     help="seconds a case batch may run before it counts as hung")
     ap.add_argument("--oracle", default=r"D:\zjou-build\release\oracle.exe")
     ap.add_argument("--bridge", default=r"D:\zjou-build\release\oracle_guest.dll",
@@ -286,6 +359,11 @@ def main():
         args.rounds = 1
     bridged = len(externals(kept))
     print(f"lifted {len(picked)} functions, {len(kept)} runnable here, {bridged} bridged callee(s)")
+    lifted = {rva: code for rva, code, _ in kept}
+    teb = {rva for rva in lifted if teb_dependent(pe, rva, lifted)}
+    if teb:
+        print(f"  {len(teb)} of them read the TEB, here or through a callee: "
+              f"compared apart, since the two processes have different TEBs")
 
     work = tempfile.mkdtemp(prefix="diff-")
     csrc = os.path.join(work, "lifted.c")
@@ -326,7 +404,7 @@ def main():
         for rva in live:
             regs = [ARENA + 0x1000 + rng.randrange(0, 0x800, 8) for _ in range(16)]
             regs[4] = RSP0
-            cases.append((rva, len(by_rva[rva]), regs, self_referential(rng)))
+            cases.append((rva, len(by_rva[rva]), regs, self_referential(rng), vector_state(rng)))
         if not cases:
             break
         expected, port = [], []
@@ -345,7 +423,7 @@ def main():
                 faulted_port.add(case[0])
         live = [rva for rva in live if rva not in faulted_both and rva not in faulted_port]
 
-    bad, checked, shown = 0, 0, 0
+    bad, checked, shown, apart = 0, 0, 0, 0
     for rva, want, mine in records:
         if want is None or mine is None or not mine["ran"]:
             continue
@@ -355,11 +433,14 @@ def main():
         # down, and the driver reported those.
         skip = {top} | {(s - ARENA) for s in mine["slots"][:mine["nslots"]]
                         if ARENA <= s < ARENA + ARENA_SIZE - 8}
-        got_regs, got_arena = mine["regs"], mine["arena"]
+        got_regs, got_arena, got_vec = mine["regs"], mine["arena"], mine["vec"]
+        if rva in teb:
+            apart += 1
+            continue
         checked += 1
         same_memory = all(got_arena[off:off + 8] == want[1][off:off + 8]
                           for off in range(0, ARENA_SIZE, 8) if off not in skip)
-        if list(got_regs) != list(want[0]) or not same_memory:
+        if list(got_regs) != list(want[0]) or not same_memory or got_vec != want[2]:
             bad += 1
             if shown < 6:
                 shown += 1
@@ -370,10 +451,17 @@ def main():
                              for off in range(0, ARENA_SIZE, 8)
                              if off not in skip and got_arena[off:off + 8] != want[1][off:off + 8]][:4]
                     clash = ["arena at " + ", ".join(where) if where else "arena differs"]
+                if got_vec != want[2]:
+                    at = [f"x{off // 32}[{(off % 32) // 8}]" for off in range(0, VEC_BYTES, 8)
+                          if got_vec[off:off + 8] != want[2][off:off + 8]][:4]
+                    clash.append("vector at " + ", ".join(at))
                 print(f"  {rva:#x}: " + ", ".join(clash))
     print(f"functions: {len(kept)} runnable, {len(kept) - len(faulted_both) - len(faulted_port)} "
           f"compared, {len(faulted_both)} fault in both, {len(faulted_port)} fault only in the port")
     print(f"against hardware: {checked} case(s) compared, {checked - bad} agree, {bad} differ")
+    if apart:
+        print(f"  {apart} further case(s) not compared: the TEB is per process, "
+              f"so the two sides cannot see the same TLS")
     return 0
 
 
