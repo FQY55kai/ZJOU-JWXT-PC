@@ -62,18 +62,23 @@ def balanced(code, rva):
 
 
 def safe(code, rva):
-    """True when every memory operand stays inside the guest stack.
+    """True when every memory operand is one this harness can give it.
 
     The oracle gives the function a real 256-byte stack and lets it run, so an
     access through an arbitrary register would fault. Bases are therefore
     limited to `rsp`/`rbp` (the frame the function builds itself) and offsets to
-    one screen of that stack.
+    one screen of that stack. `[rip + d]` is fine: it is a fixed offset into the
+    image, and both sides have the image mapped.
     """
     for insn in lift.MD.disasm(code, rva):
         for op in insn.operands:
             if op.type != capstone.x86.X86_OP_MEM:
                 continue
             base = lift.MD.reg_name(op.mem.base) if op.mem.base else ""
+            if base == "rip":
+                if not 0 <= insn.address + insn.size + op.mem.disp < lift.IMAGE_SIZE:
+                    return False
+                continue
             if base not in ("rsp", "rbp"):
                 return False
             if not -SP0 <= op.mem.disp < STACK - SP0 - 8:
@@ -105,12 +110,12 @@ def candidates_branch(exe, limit, max_bytes):
     return pe, picked
 
 
-def emit(picked, path):
+def emit(picked, path, pe=None):
     """The lifted functions plus a driver: reads cases, writes results."""
     out = ["#include <stdint.h>", "#include <stdio.h>", "#include <string.h>"]
+    out += lift.image_loader(pe)
     for i, (_, _, lines) in enumerate(picked):
         out.append(f"void f{i}(uint64_t *r, uint8_t *stk) {{")
-        out.append(f"    uint64_t sp = {SP0};")
         out.extend("    " + line for line in lines)
         out.append("}")
     out += [
@@ -119,6 +124,7 @@ def emit(picked, path):
         "int main(int argc, char **argv) {",
         "    FILE *in = fopen(argv[1], \"rb\"), *out = fopen(argv[2], \"wb\");",
         "    if (!in || !out) return 1;",
+        "    if (argc < 4 || !map_image(argv[3])) return 4;",
         "    size_t n = 0, count = sizeof table / sizeof table[0];",
         "    uint32_t head[2];",
         "    while (fread(head, sizeof head, 1, in) == 1) {",
@@ -144,6 +150,7 @@ def main():
     ap.add_argument("--rounds", type=int, default=4)
     ap.add_argument("--oracle", default=r"D:\zjou-build\release\oracle.exe")
     ap.add_argument("--branches", action="store_true", help="use the branch pass")
+    ap.add_argument("--keep", help="write the generated C here, for reading")
     args = ap.parse_args()
 
     if args.branches:
@@ -156,7 +163,11 @@ def main():
 
     work = tempfile.mkdtemp(prefix="diff-")
     csrc = os.path.join(work, "lifted.c")
-    emit(kept, csrc)
+    emit(kept, csrc, pe)
+    if args.keep:
+        os.makedirs(os.path.dirname(os.path.abspath(args.keep)), exist_ok=True)
+        with open(csrc, "rb") as src, open(args.keep, "wb") as dst:
+            dst.write(src.read())
 
     cl = lift.find_cl()
     env = dict(os.environ, INCLUDE=";".join(lift.include_dirs()), LIB=";".join(lift.lib_dirs()))
@@ -210,7 +221,7 @@ def main():
     # Ours.
     cin, cout = os.path.join(work, "all.bin"), os.path.join(work, "ours.bin")
     write_cases(cases, cin)
-    run = subprocess.run([exe, cin, cout], capture_output=True)
+    run = subprocess.run([exe, cin, cout, args.exe], capture_output=True)
     if run.returncode != 0:
         print(f"lifted driver failed: {run.returncode}")
         return 1
