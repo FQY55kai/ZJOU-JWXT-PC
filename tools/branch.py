@@ -21,6 +21,14 @@ UNSIGNED = {"a": ">", "ae": ">=", "b": "<", "be": "<="}
 SIGNED = {"g": ">", "ge": ">=", "l": "<", "le": "<="}
 EQUALITY = {"e": "==", "ne": "!="}
 
+# Instructions that leave the flags alone, so a compare stays live across them.
+# Everything else that is not a consumer invalidates it: a `cmp` followed by an
+# `add` and then a `jz` branches on the add, not on the compare.
+FLAG_SAFE = {
+    "mov", "movzx", "movsx", "movsxd", "movabs", "lea", "not", "bswap", "nop",
+    "push", "pop", "cbw", "cwde", "cdqe", "cdq", "cqo", "xchg", "endbr64",
+}
+
 
 class Refused(Exception):
     pass
@@ -98,11 +106,14 @@ def lift_function(code, rva):
             raise Refused(m)
         if m in ("adc", "sbb", "rcl", "rcr"):
             raise Refused(m)
+        if m not in FLAG_SAFE:
+            # Nothing here reads the flags, but this writes them: a later
+            # branch must not use the compare before it.
+            pending = None
         out.extend(module.lift_one(insn))
         # A write to a flag-setting instruction invalidates the pending compare
         # only if something later reads flags we did not model; since nothing
         # does (any reader is refused), the pending compare can stay until a
         # branch consumes it.
-    if pending is not None:
-        raise Refused("compare with no branch")
+    return out
     return out
