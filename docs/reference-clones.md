@@ -58,3 +58,26 @@
 X2W 用三个 runner 互比（源构建 EXE / 映射 PE / AOT 重编译），**逐字节比较输出**：纹理、帧、
 回调顺序、分配释放、退出码。我们比它强的一点是裁判是硬件（同 ISA 直接 `call` 原始字节），
 该补的是"比什么"：现在只比 16 个通用寄存器和 256 字节栈，这就是下面那条天花板的另一半。
+
+## 与本轮对应的上游提交
+
+拉过 `origin/main`（`66da8c4f..25054241`）之后，CPU 侧有几条和本仓库这一轮**撞在同一条路上**的提交。
+列在这里是因为它们的做法验证了我们的取舍，而不是因为抄了它们：
+
+| 上游提交 | 内容 | 与本仓库的关系 |
+|---|---|---|
+| `ff06794b` | `cpu_bmi2_shift_aot`：`RORX`/`SARX`/`SHLX`/`SHRX` 单独一个升举器 | 我们这轮加了同样的四条，走的是 `lift_one` 的通用路径而不是独立升举器——计数在第三操作数上、按目标宽度掩码，其余与 `shl` 无异，没有单独开文件的理由 |
+| `9f13c507` | `cpu_sse_fp_aot`：legacy SSE2 的 `CMPSD`/`MOVLPD`/`MOVHPD`/`MOVNTPD` | 我们把 legacy 的 `movss xmm,xmm`（复制全部 128 位）与 `movss xmm,m32`（清高位）当成**两种语义**处理，宁可变窄也不猜 |
+| `3d618698` | 修 SSE2 `MINSD`/`MAXSD` 在 DAZ（denormals-are-zero）下的行为、`XSAVE` 只存 AVX 的 MXCSR、MMX 读状态 | 我们的 `max`/`min` 写成 `(a > b ? a : b)` 而不是 `fmaxf`/`fminf`：SSE 的 `MAXSS` 在任一侧为 NaN 时返回**第二个**操作数，C 的那两个函数不是。DAZ 上我们的比较与硬件用的是同一条 `ucomiss`，所以随 MXCSR 一起走 |
+| `c3221992` / `b291e792` | VEX.256 `VPACKSSWB` 系列、VEX.128 `VPADDB`/`VPCMPEQB`/`VPCMPGTB` | 我们还没做。它们在拒绝面里分别是 `vblendps`/`vpcmpeqb`/`vcmpeqps` 那一族（2,232 个）——需要一个能表达 128 位比较的中间表示，是下一个里程碑 |
+
+一条**没有**采纳的差异：上游按指令族拆成多个升举器文件（`cpu_leaf_aot`、`cpu_avx_int_aot`、
+`cpu_sse_fp_aot`、`cpu_bmi2_shift_aot`……）。本仓库只有一个 `lift_one`，因为这里的目标是先把
+"翻译 → 编译 → 与硬件比"这个环跑通，而不是先长成一张指令表。指令数一旦过千，这个决定要重做。
+
+## 一个还没建模的状态：MXCSR
+
+整个 `.pdata` 里只有一对 `vldmxcsr`/`vstmxcsr`，所在函数我们不升举（正确拒绝），所以它留在了桥后面。
+后果是：**舍入模式与 DAZ/FTZ 都没有作为状态进差分**。函数自己存了再恢复就没事；如果哪一处
+`ldmxcsr` 改了模式却不恢复，被它影响的浮点结果就会落在"两侧进程各自的 MXCSR"上——和 TEB 一样，
+属于量具的边界。要收掉它，得让 `vldmxcsr`/`vstmxcsr` 进模型并把 MXCSR 记进用例记录。

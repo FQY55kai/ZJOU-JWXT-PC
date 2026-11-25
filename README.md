@@ -131,6 +131,9 @@ return f"((uint{bits}_t)({a}) {UNSIGNED[suffix]} (uint{bits}_t)({b}))"
 不是翻译的缺陷。一个真正脱离了裁判的移植版本只有一份 TEB，那时它是自洽的。
 
 同样的道理适用于 IAT 里解析出来的函数地址：跨进程不同，被存进 arena 就会成为差异。
+以及 `MXCSR`：整个 `.pdata` 里只有一对 `vldmxcsr`/`vstmxcsr`，所在函数我们正确拒绝、留在桥后面，
+所以舍入模式与 DAZ/FTZ **没有作为状态进差分**。函数自己存了再恢复就没事；改了不恢复就会像 TEB 一样
+落到"两个进程各自的 MXCSR"上。收掉它要让这两条进模型，并把 MXCSR 记进用例记录。
 
 ### 桥：唯一的"作弊点"，也是唯一的可行点
 
@@ -221,6 +224,10 @@ cd tools/oracle; cargo build --release    # oracle.exe + oracle_guest.dll（桥�
 5. **Microsoft PE/COFF Specification** — `.pdata` / `RUNTIME_FUNCTION` 布局。
 6. **MSVC 内建函数文档** — `_udiv128` / `_div128`（`div`/`idiv` 的 128÷64 就是这条指令本身，所以在除零与商溢出上**与硬件一同 `#DE`**，不需要自己发明边界行为）、`_umul128`（`mulx`）、`__readgsqword`（`gs:` 的 TEB 基址）、`_setjmp`/`longjmp`（逐例故障恢复）。
 7. **解析与构建工具**：`capstone`（反汇编）、`pefile`（PE 解析）、`cl.exe`、`rustc`/`llvm-mc`（内联汇编的 VEX 编码）。
+
+上游 CPU 侧与本轮对应的四组提交（BMI2 移位升举器、legacy SSE2 浮点搬运、`MINSD`/`MAXSD` 的 DAZ、VEX 掩码比较）
+逐条对照见 [`docs/reference-clones.md`](docs/reference-clones.md) 末节——包括一条**没有**采纳的差异：
+上游按指令族拆成多个升举器文件，本仓库只有一个 `lift_one`，因为这里要先跑通"翻译 → 编译 → 与硬件比"这个环。
 
 各参考仓库的阅读笔记见 [`docs/reference-xbox2windows.md`](docs/reference-xbox2windows.md) 与 [`docs/reference-clones.md`](docs/reference-clones.md)。
 
