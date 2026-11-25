@@ -26,7 +26,8 @@
 
 ## M1.5 —— 闭包升举（新，优先于 M2）
 
-- [ ] 调用图：`call rel32` → 目标 RVA；尾调用 `jmp` 同表
+- [x] 调用图：`call rel32` → 目标 RVA；尾调用 `jmp` 同表（`tools/callgraph.py`）
+- [x] 函数表生长：`call` 目标即函数起点，迭代到收敛（`tools/functable.py`，+16,733 个起点）
 - [ ] 逆拓扑序升举一整份 C，`call` 变直接调用
 - [ ] `call_original(rva)` 兜住未覆盖目标（复用 oracle 的调用桩）
 - [ ] 差分改为"链接整份代码后跑入口"，不再单函数独立跑
