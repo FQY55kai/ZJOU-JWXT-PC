@@ -1,0 +1,2 @@
+date	sha	size	guid	age	translation	total	snippets	snippet_total	functions	closure	hle_left	note
+2026-11-26	5d493dbdfaa8c425	120181760	ba12692a4feb7f424c4c44205044422e	1	39976	40002	609	609	124/125	0	37	first row: jump-table bound fix landed
