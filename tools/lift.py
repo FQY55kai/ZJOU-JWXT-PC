@@ -270,6 +270,26 @@ VEC_LOGIC = {
 # Packed and scalar float arithmetic, in the width of the lane. `max`/`min` are
 # ternaries and not `fmaxf`/`fminf`: the SSE instruction returns its *second*
 # operand when either side is NaN, and the C functions return the other one.
+# 硬件近似指令：答案就是那条指令的答案，不是它的数学定义。`1/sqrtf(x)` 与
+# `1/x` 在最后几位上必然不同——rsqrt/rcp 是查表的近似，只在少数输入上与正确舍入
+# 重合。要位相等只有一条路：让处理器自己算。MSVC 的 `_mm_rsqrt_ps`/`_mm_rcp_ps`
+# **就是**这两条指令（SSE 基线，不需要 /arch），所以这里不是"重写语义"，是执行它。
+#
+# 256 位形式用两次 128 位代替：每个通道的近似只依赖它自己那一位，两个半边的结果
+# 拼起来与一条 256 位指令逐位相同。片段差分（`diff.py --snippets`）拿硬件对过这一点。
+VEC_APPROX = {"rsqrtps": ("rsqrt", True), "rcpps": ("rcp", True),
+              "rsqrtss": ("rsqrt", False), "rcpss": ("rcp", False)}
+
+# 融合乘加：`a*b+c` 在 C 里舍入两次，指令只舍入一次，所以没有任何 C 表达式能复现它。
+# 唯一忠实的写法是那一条 intrinsic——它就是那条指令。三个数字说的是"第一个因子、
+# 第二个因子、被加数"分别是哪一个操作数：132 是 DEST*SRC2+SRC1，213 是
+# SRC1*DEST+SRC2，231 是 SRC1*SRC2+DEST（Intel SDM, VFMADD132PS 等）。
+# 标量形式的 `127:32` 一律来自 SRC1，与 VEX 标量算术同一条规则。
+FMA = {(kind + order + suffix): (kind, order, suffix)
+       for kind in ("fmadd", "fmsub", "fnmadd", "fnmsub")
+       for order in ("132", "213", "231")
+       for suffix in ("ps", "pd", "ss", "sd")}
+
 VEC_FLOAT = {
     "addps": ("+", True), "subps": ("-", True), "mulps": ("*", True),
     "divps": ("/", True), "maxps": ("MAX", True), "minps": ("MIN", True),
@@ -318,14 +338,49 @@ VEC_CMP_FLOAT = {
     3: "!({a} == {a}) || !({b} == {b})", 4: "!({a} == {b})",
     5: "!({a} < {b})", 6: "!({a} <= {b})",
     7: "({a} == {a}) && ({b} == {b})",
+    # AVX widened the immediate to five bits: the extra sixteen encodings are the
+    # same eight relations with a different quiet/signaling pairing, plus `ge`,
+    # `gt`, `false` and `true`. Quiet and signaling differ only in which
+    # exceptions they raise; the mask they produce is the same, and this port
+    # models no exceptions at all, so each one folds onto the relation it means.
+    8: "{a} == {b}",             # eq_uq
+    9: "!({a} >= {b})",          # nge_us
+    10: "!({a} > {b})",          # ngt_us
+    11: "0",                     # false_oq
+    12: "!({a} == {b})",         # neq_oq
+    13: "{a} >= {b}",            # ge_os
+    14: "{a} > {b}",             # gt_os
+    15: "1",                     # true_uq
+    16: "{a} == {b}",            # eq_os
+    17: "{a} < {b}",             # lt_oq
+    18: "{a} <= {b}",            # le_oq
+    19: "!({a} == {a}) || !({b} == {b})",   # unord_s
+    20: "!({a} == {b})",         # neq_us
+    21: "!({a} < {b})",          # nlt_uq
+    22: "!({a} <= {b})",         # nle_uq
+    23: "({a} == {a}) && ({b} == {b})",     # ord_s
+    24: "{a} == {b}",            # eq_us
+    25: "!({a} >= {b})",         # nge_uq
+    26: "!({a} > {b})",          # ngt_uq
+    27: "0",                     # false_os
+    28: "!({a} == {b})",         # neq_os
+    29: "{a} >= {b}",            # ge_oq
+    30: "{a} > {b}",             # gt_oq
+    31: "1",                     # true_us
 }
 
 # Capstone names `cmpps` by the predicate it was given — `vcmpeqps`,
-# `vcmpltss` — and then does not report the immediate, so the predicate has to
-# be read back out of the mnemonic. The eight names are the eight encodings.
+# `vcmplt_oqps` — and then does not report the immediate, so the predicate has to
+# be read back out of the mnemonic. The names are the encodings.
 CMP_PREDICATE = {
     "eq": 0, "lt": 1, "le": 2, "unord": 3,
     "neq": 4, "nlt": 5, "nle": 6, "ord": 7,
+    "eq_uq": 8, "nge_us": 9, "ngt_us": 10, "false_oq": 11,
+    "neq_oq": 12, "ge_os": 13, "gt_os": 14, "true_uq": 15,
+    "eq_os": 16, "lt_oq": 17, "le_oq": 18, "unord_s": 19,
+    "neq_us": 20, "nlt_uq": 21, "nle_uq": 22, "ord_s": 23,
+    "eq_us": 24, "nge_uq": 25, "ngt_uq": 26, "false_os": 27,
+    "neq_os": 28, "ge_oq": 29, "gt_oq": 30, "true_us": 31,
 }
 
 # Shuffles and interleaves are all one shape: a list of which chunk of which
@@ -385,8 +440,31 @@ VEC_DUP = {"movshdup": 1, "movsldup": 0}
 VEC_SQRT = {"sqrtps": (4, True), "sqrtpd": (8, True),
             "sqrtss": (4, False), "sqrtsd": (8, False)}
 
-VEC_STEMS = (set(VEC_MOVE) | set(VEC_LOGIC) | set(VEC_FLOAT) | set(VEC_BROADCAST)
-             | set(VEC_BLEND) | set(VEC_CMP_INT) | set(VEC_UNPACK)
+# 取整。`imm[1:0]` 选方向，`imm[3]` 只抑制精度异常（本移植不建模异常，所以恒置
+# 上，结果不变）。四个方向与 `_mm_round_*` 的四个常量一一对应，因此还是那条指令。
+VEC_ROUND = {"roundps": (4, True), "roundpd": (8, True),
+             "roundss": (4, False), "roundsd": (8, False)}
+ROUND_MODE = ("_MM_FROUND_TO_NEAREST_INT", "_MM_FROUND_TO_NEG_INF",
+              "_MM_FROUND_TO_POS_INF", "_MM_FROUND_TO_ZERO")
+
+# 窄到宽的元素扩展：每个输出元素是源里一个更窄的元素，符号扩展或零扩展。
+# 名字里的两个字母就是宽度——b/w/d/q 是 1/2/4/8 字节。
+_WIDTH_LETTER = {1: "b", 2: "w", 4: "d", 8: "q"}
+VEC_EXTEND = {}
+for _s, _d in ((1, 2), (1, 4), (1, 8), (2, 4), (2, 8), (4, 8)):
+    for _k, _sign in (("s", True), ("z", False)):
+        VEC_EXTEND[f"pmov{_k}x{_WIDTH_LETTER[_s]}{_WIDTH_LETTER[_d]}"] = (_s, _d, _sign)
+del _s, _d, _k, _sign
+
+# 饱和打包：两个源的元素各占输出的一半（第一个源在低半），元素被夹到目标宽度里。
+# 四个形态就是"有符号还是有符号"与"窄多少"的两种组合。
+VEC_PACK = {"packsswb": (2, 1, True), "packssdw": (4, 2, True),
+            "packuswb": (2, 1, False), "packusdw": (4, 2, False)}
+
+
+
+VEC_STEMS = (set(VEC_MOVE) | set(VEC_LOGIC) | set(VEC_FLOAT) | set(VEC_BROADCAST)             | set(VEC_BLEND) | set(VEC_CMP_INT) | set(VEC_UNPACK)
+             | set(VEC_APPROX) | set(FMA)
              | set(VEC_INT_ARITH) | set(VEC_HADD) | set(VEC_SHIFT)
              | set(VEC_SIGN) | set(VEC_DUP) | set(VEC_SQRT)
              | {"cmpps", "cmppd", "cmpss", "cmpsd", "shufps", "shufpd",
@@ -401,6 +479,14 @@ VEC_STEMS = (set(VEC_MOVE) | set(VEC_LOGIC) | set(VEC_FLOAT) | set(VEC_BROADCAST
 # that code: this module's own check and the differential harness. A helper
 # defined in only one of them is a link error in the other, found late.
 HELPERS = [
+    "// `popcnt` 用逐位归并算，而不是 intrinsic：`__popcnt` 在没开 /arch:SSE4.2 时",
+    "// 会变成一次运行库调用，链接不上；而这条式子对任何宽度都是精确的。",
+    "static uint64_t popcount64(uint64_t x) {",
+    "    x = x - ((x >> 1) & UINT64_C(0x5555555555555555));",
+    "    x = (x & UINT64_C(0x3333333333333333)) + ((x >> 2) & UINT64_C(0x3333333333333333));",
+    "    x = (x + (x >> 4)) & UINT64_C(0x0F0F0F0F0F0F0F0F);",
+    "    return (x * UINT64_C(0x0101010101010101)) >> 56;",
+    "}",
     "// `tzcnt` and `lzcnt` are defined at zero — the count is the operand's",
     "// width — which `bsf`/`bsr` are not, so the intrinsic's failure return is",
     "// part of the answer rather than a case to refuse.",
@@ -621,6 +707,408 @@ def vec_line(insn):
             return [wr(ops[0], f"v[{index}][0]", insn)]
         raise Refused(f"{m} form")
 
+    # 立即数每两位选一个双字；256 位形式在各自 128 位通道内重排。`vpermilps`
+    # 的立即数形式与 `pshufd` 是同一件事（变量形式是另一个操作数，不走这里）。
+    if stem in ("pshufd", "permilps") and len(ops) == 3 and \
+            ops[2].type == capstone.x86.X86_OP_IMM:
+        if len(ops) != 3 or ops[2].type != capstone.x86.X86_OP_IMM:
+            raise Refused(f"{m} arity")
+        dst, source, sel = ops
+        if not is_vec(dst):
+            raise Refused(f"{m} to memory")
+        index, width = vec(dst)
+        lines = ["{"]
+        pt = (f"(const uint8_t *)(uintptr_t){addr(source, insn)}"
+              if source.type == capstone.x86.X86_OP_MEM
+              else f"(const uint8_t *){lane(vec(source)[0])}")
+        lines.append(f"    const uint8_t *ps = {pt};")
+        for u in range(max(1, width // 16)):
+            for n in range(4):
+                pick = (sel.imm >> (2 * n)) & 3
+                lines.append(f"    uint32_t s{u}{n}; memcpy(&s{u}{n}, ps + "
+                             f"{u * 16 + 4 * pick}, 4);")
+        for u in range(max(1, width // 16)):
+            for n in range(4):
+                lines.append(f"    memcpy((char *){lane(index)} + "
+                             f"{u * 16 + 4 * n}, &s{u}{n}, 4);")
+        if width == 16 and vex:
+            lines += ["    " + z for z in upper_zeroed(index)]
+        lines.append("}")
+        return lines
+
+    if stem == "pextrb":
+        # 抽一个字节出来。目标是通用寄存器时零扩展到 32 位，`wr` 负责这件事。
+        if len(ops) != 3 or ops[2].type != capstone.x86.X86_OP_IMM:
+            raise Refused(f"{m} arity")
+        dst, source, sel = ops
+        index, _ = vec(source)
+        at = f"((const uint8_t *){lane(index)})[{sel.imm}]"
+        return [wr(dst, at, insn)]
+
+    if stem == "pextrw":
+        # 同理，两字节一个元素；抽出来的 16 位写进 32 位寄存器时是零扩展。
+        if len(ops) != 3 or ops[2].type != capstone.x86.X86_OP_IMM:
+            raise Refused(f"{m} arity")
+        dst, source, sel = ops
+        index, _ = vec(source)
+        at = (f"(*(const uint16_t *)((const char *){lane(index)} + {2 * sel.imm}))")
+        return [wr(dst, at, insn)]
+
+    if stem in ("pinsrb", "pinsrw", "pinsrd", "pinsrq"):
+        # 把一个元素塞进第 imm 个位置，其余原样保留（VEX 的第二个源就是"其余"）。
+        width_of = {"pinsrb": 1, "pinsrw": 2, "pinsrd": 4, "pinsrq": 8}[stem]
+        if len(ops) != 4 or ops[3].type != capstone.x86.X86_OP_IMM:
+            raise Refused(f"{m} arity")
+        dst, base, value, sel = ops
+        if not is_vec(dst):
+            raise Refused(f"{m} to memory")
+        index, width = vec(dst)
+        lines = ["{"]
+        if vec(base)[0] != index:
+            lines.append(f"    memcpy({lane(index)}, {lane(vec(base)[0])}, {width}u);")
+        got = (f"(*(const uint{width_of * 8}_t *)(uintptr_t){addr(value, insn)})"
+               if value.type == capstone.x86.X86_OP_MEM
+               else f"(uint{width_of * 8}_t){src(value, insn)}")
+        lines.append(f"    {{ uint{width_of * 8}_t w = {got}; "
+                     f"memcpy((char *){lane(index)} + {width_of * sel.imm}, &w, "
+                     f"{width_of}); }}")
+        if width == 16 and vex:
+            lines += ["    " + z for z in upper_zeroed(index)]
+        lines.append("}")
+        return lines
+
+    if stem == "pextrd":
+        # 四字节一个元素；写进 64 位寄存器时零扩展到 32 位。
+        if len(ops) != 3 or ops[2].type != capstone.x86.X86_OP_IMM:
+            raise Refused(f"{m} arity")
+        dst, source, sel = ops
+        index, _ = vec(source)
+        at = (f"(*(const uint32_t *)((const char *){lane(index)} + {4 * sel.imm}))")
+        return [wr(dst, at, insn)]
+
+    if stem in ("cvtss2sd", "cvtsd2ss"):
+        # 单元素精度转换。低一个元素是换算的结果，`127:32` 按 VEX 的规矩取自
+        # src1（两操作数的 legacy 形式则留在目标自己身上）。
+        if len(ops) == 3:
+            dst, a, source = ops
+        elif len(ops) == 2:
+            dst, a, source = ops[0], None, ops[1]
+        else:
+            raise Refused(f"{m} arity")
+        if not is_vec(dst):
+            raise Refused(f"{m} to memory")
+        index, width = vec(dst)
+        if source.type == capstone.x86.X86_OP_MEM:
+            sp = f"(const void *)(uintptr_t){addr(source, insn)}"
+        else:
+            sp = f"(const void *){lane(vec(source)[0])}"
+        if stem == "cvtss2sd":
+            step, src_t, dst_t = 8, "float", "double"
+        else:
+            step, src_t, dst_t = 4, "double", "float"
+        lines = ["{",
+                 f"    {dst_t} d = ({dst_t})(*(const {src_t} *){sp});"]
+        if a is not None and vec(a)[0] != index:
+            lines.append(f"    memcpy({lane(index)}, {lane(vec(a)[0])}, {width}u);")
+        lines.append(f"    memcpy({lane(index)}, &d, {step});")
+        if width == 16 and vex:
+            lines += ["    " + z for z in upper_zeroed(index)]
+        lines.append("}")
+        return lines
+
+    if stem == "pshufb":
+        # 逐字节查表：掩码字节的最高位为 1 就清零，否则取通道内第 (掩码 & 0x0F)
+        # 个字节。源是第二个操作数，掩码是第三个；256 位形式在各自 128 位通道内查。
+        if len(ops) == 3:
+            dst, source, mask = ops
+        elif len(ops) == 2:
+            dst, source, mask = ops[0], ops[0], ops[1]
+        else:
+            raise Refused(f"{m} arity")
+        if not is_vec(dst):
+            raise Refused(f"{m} to memory")
+        index, width = vec(dst)
+        lines = ["{"]
+
+        def ptr(op, name):
+            at = (f"(const uint8_t *)(uintptr_t){addr(op, insn)}"
+                  if op.type == capstone.x86.X86_OP_MEM
+                  else f"(const uint8_t *){lane(vec(op)[0])}")
+            lines.append(f"    const uint8_t *{name} = {at};")
+
+        ptr(source, "ps")
+        ptr(mask, "pm")
+        # 先算出全部 32 个字节再写：目标和源常常是同一个寄存器。
+        for u in range(max(1, width // 16)):
+            for k in range(16):
+                lines.append(f"    uint8_t b{u}_{k};")
+        for u in range(max(1, width // 16)):
+            for k in range(16):
+                mk = f"pm[{u * 16 + k}]"
+                lines.append(f"    b{u}_{k} = ({mk} & 0x80) ? 0 : "
+                             f"ps[{u * 16} + ({mk} & 0x0F)];")
+        for u in range(max(1, width // 16)):
+            for k in range(16):
+                lines.append(f"    memcpy((char *){lane(index)} + {u * 16 + k}, "
+                             f"&b{u}_{k}, 1);")
+        if width == 16 and vex:
+            lines += ["    " + z for z in upper_zeroed(index)]
+        lines.append("}")
+        return lines
+
+    if stem in ("inserti128", "insertf128"):
+        # 把一个 128 位通道塞进第 imm 位，另一个通道保留（VEX 的第二个源就是它）。
+        if len(ops) != 4 or ops[3].type != capstone.x86.X86_OP_IMM:
+            raise Refused(f"{m} arity")
+        dst, base, value, sel = ops
+        if not is_vec(dst):
+            raise Refused(f"{m} to memory")
+        index, width = vec(dst)
+        chunk = sel.imm & 1
+        src_at = (f"(const void *)(uintptr_t){addr(value, insn)}"
+                  if value.type == capstone.x86.X86_OP_MEM
+                  else f"(const void *){lane(vec(value)[0])}")
+        # 插入的值可能就住在目标寄存器里（`vinserti128 ymm7, ymm8, xmm7, 1`），
+        # 所以先把那 16 字节搬到栈上，再去覆盖目标。
+        lines = ["{", f"    uint8_t t[16]; memcpy(t, {src_at}, 16);"]
+        if vec(base)[0] != index:
+            lines.append(f"    memcpy({lane(index)}, {lane(vec(base)[0])}, {width}u);")
+        lines.append(f"    memcpy((char *){lane(index)} + {16 * chunk}, t, 16);")
+        lines.append("}")
+        return lines
+
+    if stem in ("pshuflw", "pshufhw"):
+        # 只重排低半或高半的四个字，另一半原样保留；256 位形式各自 128 位通道内做。
+        if len(ops) != 3 or ops[2].type != capstone.x86.X86_OP_IMM:
+            raise Refused(f"{m} arity")
+        dst, source, sel = ops
+        if not is_vec(dst):
+            raise Refused(f"{m} to memory")
+        index, width = vec(dst)
+        base = 0 if stem == "pshuflw" else 8
+        lines = ["{"]
+        pt = (f"(const uint8_t *)(uintptr_t){addr(source, insn)}"
+              if source.type == capstone.x86.X86_OP_MEM
+              else f"(const uint8_t *){lane(vec(source)[0])}")
+        lines.append(f"    const uint8_t *ps = {pt};")
+        # 先把四个字全读出来再写：源与目标常常是同一个寄存器。
+        units = max(1, width // 16)
+        for u in range(units):
+            for n in range(4):
+                pick = (sel.imm >> (2 * n)) & 3
+                lines.append(f"    uint16_t w{u}_{n}; memcpy(&w{u}_{n}, ps + "
+                             f"{u * 16 + base + 2 * pick}, 2);")
+        lines.append(f"    memcpy((char *){lane(index)}, ps, {width}u);")
+        for u in range(units):
+            for n in range(4):
+                lines.append(f"    memcpy((char *){lane(index)} + "
+                             f"{u * 16 + base + 2 * n}, &w{u}_{n}, 2);")
+        if width == 16 and vex:
+            lines += ["    " + z for z in upper_zeroed(index)]
+        lines.append("}")
+        return lines
+
+    if stem in ("hsubps", "hsubpd"):
+        # 水平相减：每个 128 位通道里，低半的元素减相邻的高半元素。
+        wide = 8 if stem.endswith("pd") else 4
+        ctype = "double" if wide == 8 else "float"
+        if len(ops) == 3:
+            dst, a, b = ops
+        elif len(ops) == 2:
+            dst, a, b = ops[0], ops[0], ops[1]
+        else:
+            raise Refused(f"{m} arity")
+        if not is_vec(dst):
+            raise Refused(f"{m} to memory")
+        index, width = vec(dst)
+        per = 16 // wide                 # 每个 128 位通道的元素个数
+        lines = ["{"]
+        for u in range(max(1, width // 16)):
+            for k in range(per // 2):
+                x = element(a, u * per + 2 * k, ctype, wide, insn)
+                y = element(a, u * per + 2 * k + 1, ctype, wide, insn)
+                lines.append(f"    {ctype} d{u}_{k} = ({x}) - ({y});")
+            for k in range(per // 2):
+                x = element(b, u * per + 2 * k, ctype, wide, insn)
+                y = element(b, u * per + 2 * k + 1, ctype, wide, insn)
+                lines.append(f"    {ctype} e{u}_{k} = ({x}) - ({y});")
+        for u in range(max(1, width // 16)):
+            for k in range(per // 2):
+                lines.append(f"    memcpy((char *){lane(index)} + "
+                             f"{u * 16 + wide * k}, &d{u}_{k}, {wide});")
+            for k in range(per // 2):
+                lines.append(f"    memcpy((char *){lane(index)} + "
+                             f"{u * 16 + wide * (per // 2 + k)}, &e{u}_{k}, {wide});")
+        if width == 16 and vex:
+            lines += ["    " + z for z in upper_zeroed(index)]
+        lines.append("}")
+        return lines
+
+    if stem in ("extracti128", "extractf128"):
+        # 抽出 128 位的通道；目标只能是 xmm 或内存。
+        if len(ops) != 3 or ops[2].type != capstone.x86.X86_OP_IMM:
+            raise Refused(f"{m} arity")
+        dst, source, sel = ops
+        index, _ = vec(source)
+        chunk = sel.imm & 1
+        src_at = f"((const char *){lane(index)} + {16 * chunk})"
+        if is_vec(dst):
+            d, dw = vec(dst)
+            lines = [f"memcpy({lane(d)}, {src_at}, 16);"]
+            if dw == 16 and vex:
+                lines += upper_zeroed(d)
+            return lines
+        return [f"memcpy((void *)(uintptr_t){addr(dst, insn)}, {src_at}, 16);"]
+
+    if stem in ("cvtps2ph", "cvtph2ps"):
+        if len(ops) not in (2, 3):
+            raise Refused(f"{m} arity")
+        dst, source = ops[0], ops[1]
+        if not is_vec(dst):
+            raise Refused(f"{m} to memory")
+        index, width = vec(dst)
+        lines = ["{"]
+        pt = (f"(const void *)(uintptr_t){addr(source, insn)}"
+              if source.type == capstone.x86.X86_OP_MEM
+              else f"(const void *){lane(vec(source)[0])}")
+        if stem == "cvtps2ph":
+            sel = ops[2] if len(ops) == 3 else None
+            if sel is None or sel.type != capstone.x86.X86_OP_IMM:
+                raise Refused(f"{m} without a rounding mode")
+            if sel.imm & 4:
+                # bit 2 让指令去读 MXCSR，这个移植没有建模它，不能猜。
+                raise Refused(f"{m} rounding from MXCSR")
+            mode = f"{ROUND_MODE[sel.imm & 3]} | _MM_FROUND_NO_EXC"
+            sw = vec(source)[1] if is_vec(source) else ops[1].size
+            lines.append(f"    const char *ps = (const char *){pt};")
+            for off in range(0, sw, 16):
+                lines.append(f"    {{ __m128i h = _mm_cvtps_ph(_mm_loadu_ps("
+                             f"(const float *)(ps + {off})), {mode}); "
+                             f"memcpy((char *){lane(index)} + {off // 2}, &h, 8); }}")
+            # 只写一半的字节数，剩下的（xmm 目标的高 8 字节）指令是清零的。
+            written = (sw // 16) * 8
+            if width > written:
+                lines.append(f"    memset((char *){lane(index)} + {written}, 0, "
+                             f"{width - written});")
+        else:
+            lines.append(f"    const char *ps = (const char *){pt};")
+            for off in range(0, width, 16):
+                lines.append(f"    _mm_storeu_ps((float *)((char *){lane(index)} + {off}), "
+                             f"_mm_cvtph_ps(_mm_loadu_si128((const __m128i *)"
+                             f"(ps + {off // 2}))));")
+        if width == 16 and vex:
+            lines += ["    " + z for z in upper_zeroed(index)]
+        lines.append("}")
+        return lines
+
+    if stem in VEC_PACK:
+        wide, narrow, signed = VEC_PACK[stem]
+        if len(ops) == 3:
+            dst, s1, s2 = ops
+        elif len(ops) == 2:
+            dst, s1, s2 = ops[0], ops[0], ops[1]
+        else:
+            raise Refused(f"{m} arity")
+        if not is_vec(dst):
+            raise Refused(f"{m} to memory")
+        index, width = vec(dst)
+        # 打包在 128 位的通道内部进行：256 位形式是两个通道各自打包，不是把两半
+        # 拼起来再打。所以按 16 字节一段处理，每段 8 字节来自第一个源。
+        unit = 16
+        half = unit // 2
+        per_source = half // narrow
+        lo = -(1 << (narrow * 8 - 1)) if signed else 0
+        hi = (1 << (narrow * 8 - 1)) - 1 if signed else (1 << (narrow * 8)) - 1
+        stype = f"{'int' if signed else 'uint'}{narrow * 8}_t"
+        lines = ["{"]
+        for side, op in enumerate((s1, s2)):
+            pt = (f"(const uint8_t *)(uintptr_t){addr(op, insn)}"
+                  if op.type == capstone.x86.X86_OP_MEM
+                  else f"(const uint8_t *){lane(vec(op)[0])}")
+            lines.append(f"    const uint8_t *p{side} = {pt};")
+        for u in range(max(1, width // unit)):
+            for side in range(2):
+                for n in range(per_source):
+                    t = f"t{u}{side}{n}"
+                    # 源一律按有符号读：`packuswb` 的源是 int16，负值饱和成 0，
+                    # 按无符号读会把它当成 65535 而夹到 255。
+                    lines.append(
+                        f"    int64_t {t} = (int64_t)(*(const int{wide * 8}_t *)"
+                        f"(p{side} + {u * unit + wide * n}));")
+                    lines.append(f"    {t} = {t} < {lo} ? {lo} : "
+                                 f"({t} > {hi} ? {hi} : {t});")
+        # 全部读完再写：目标常常就是其中一个源（`vpackssdw ymm3, ymm4, ymm3` 是
+        # 编译器最常发的形状），边读边写会让后读的元素拿到已经被盖掉的值。
+        for u in range(max(1, width // unit)):
+            for side in range(2):
+                for n in range(per_source):
+                    lines.append(
+                        f"    {{ {stype} w{u}{side}{n} = ({stype})t{u}{side}{n}; "
+                        f"memcpy((char *){lane(index)} + "
+                        f"{u * unit + side * half + narrow * n}, "
+                        f"&w{u}{side}{n}, {narrow}); }}")
+        if width == 16 and vex:
+            lines += ["    " + z for z in upper_zeroed(index)]
+        lines.append("}")
+        return lines
+
+    if stem in VEC_EXTEND:
+        narrow, wide, signed = VEC_EXTEND[stem]
+        if len(ops) != 2:
+            raise Refused(f"{m} arity")
+        dst, source = ops
+        if not is_vec(dst):
+            raise Refused(f"{m} to memory")
+        index, width = vec(dst)
+        lanes = width // wide
+        if source.type == capstone.x86.X86_OP_MEM:
+            ps = f"(const uint8_t *)(uintptr_t){addr(source, insn)}"
+        else:
+            ps = f"(const uint8_t *){lane(vec(source)[0])}"
+        # 逐元素搬：源在内存时每个元素只读 `narrow` 字节，整寄存器地去读会越过它。
+        lines = ["{", f"    const uint8_t *ps = {ps};"]
+        for n in range(lanes):
+            src_at = f"(*(const {'int' if signed else 'uint'}{narrow * 8}_t *)" \
+                     f"(ps + {narrow * n}))"
+            lines.append(f"    {'int' if signed else 'uint'}{wide * 8}_t w{n} = "
+                         f"({'int' if signed else 'uint'}{wide * 8}_t){src_at};")
+        for n in range(lanes):
+            lines.append(f"    memcpy((char *){lane(index)} + {wide * n}, &w{n}, {wide});")
+        if width == 16 and vex:
+            lines += ["    " + z for z in upper_zeroed(index)]
+        lines.append("}")
+        return lines
+
+    if stem == "movlhps" and len(ops) in (2, 3):
+        # 低半来自第一个源，高半来自第二个源。legacy 的两操作数形式没有第二个源：
+        # 低半留在目标自己身上，高半接源的低半。
+        dst = ops[0]
+        if not is_vec(dst):
+            raise Refused(f"{m} to memory")
+        index, width = vec(dst)
+        lo = ops[1] if len(ops) == 3 else dst
+        hi = ops[2] if len(ops) == 3 else ops[1]
+        lines = ["{",
+                 f"    uint64_t lo, hi;",
+                 f"    memcpy(&lo, {lane_ptr(lo, 0, insn)}, 8);",
+                 f"    memcpy(&hi, {lane_ptr(hi, 0, insn)}, 8);",
+                 f"    memcpy({lane(index)}, &lo, 8);",
+                 f"    memcpy((char *){lane(index)} + 8, &hi, 8);"]
+        if width == 16 and vex:
+            lines += ["    " + z for z in upper_zeroed(index)]
+        lines.append("}")
+        return lines
+
+    if stem == "extractps":
+        if len(ops) != 3:
+            raise Refused(f"{m} arity")
+        dst, source, sel = ops
+        if sel.type != capstone.x86.X86_OP_IMM:
+            raise Refused(f"{m} without a lane")
+        index, _ = vec(source)
+        lane_at_imm = f"(*(const uint32_t *)((const char *){lane(index)} + {4 * sel.imm}))"
+        return [wr(dst, lane_at_imm, insn)]
+
     if stem in VEC_LOGIC:
         if len(ops) == 3:
             dst, a, b = ops
@@ -639,6 +1127,109 @@ def vec_line(insn):
         # untouched, so a destination that is also a source stays correct.
         if width == 16 and vex:
             lines += upper_zeroed(index)
+        return lines
+
+    if stem in VEC_APPROX:
+        which, packed = VEC_APPROX[stem]
+        if len(ops) == 3:
+            dst, a, source = ops
+        elif len(ops) == 2:
+            dst, a, source = ops[0], ops[0], ops[1]
+        else:
+            raise Refused(f"{m} arity")
+        if not is_vec(dst):
+            raise Refused(f"{m} to memory")
+        index, width = vec(dst)
+        if source.type == capstone.x86.X86_OP_MEM:
+            srco = f"(const char *)(uintptr_t){addr(source, insn)}"
+        else:
+            srco = f"(const char *){lane(vec(source)[0])}"
+        call = "_mm_rsqrt_ps" if which == "rsqrt" else "_mm_rcp_ps"
+        scall = "_mm_rsqrt_ss" if which == "rsqrt" else "_mm_rcp_ss"
+        lines = ["{"]
+        if packed:
+            lines.append(f"    const char *s = {srco};")
+            lines.append(f"    for (unsigned off = 0; off < {width}u; off += 16u) {{")
+            lines.append(f"        __m128 x = _mm_loadu_ps((const float *)(s + off));")
+            lines.append(f"        _mm_storeu_ps((float *)((char *){lane(index)} + off), {call}(x));")
+            lines.append("    }")
+        else:
+            # 标量形式只换低 32 位：`127:32` 来自另一个源（VEX 的三操作数形式）
+            # 或留在目标自己身上（legacy 的两操作数形式）——与 `sqrtss` 同一条
+            # 规则，所以这里照它的写法：整寄存器先搬过来，再盖掉低 4 字节。
+            if a is not None and (a.type == capstone.x86.X86_OP_MEM
+                                  or vec(a)[0] != index):
+                if a.type == capstone.x86.X86_OP_MEM:
+                    lines.append(f"    memcpy({lane(index)}, (const void *)(uintptr_t)"
+                                 f"{addr(a, insn)}, {width}u);")
+                else:
+                    lines.append(f"    memcpy({lane(index)}, {lane(vec(a)[0])}, {width}u);")
+            lines.append(f"    float d = _mm_cvtss_f32({scall}("
+                         f"_mm_loadu_ps((const float *)({srco}))));")
+            lines.append(f"    memcpy({lane(index)}, &d, 4);")
+        if width == 16 and vex:
+            lines += ["    " + z for z in upper_zeroed(index)]
+        lines.append("}")
+        return lines
+
+    if stem in FMA:
+        kind, order, suffix = FMA[stem]
+        if len(ops) != 3:
+            raise Refused(f"{m} arity")
+        dst, s1, s2 = ops
+        if not is_vec(dst):
+            raise Refused(f"{m} to memory")
+        index, width = vec(dst)
+        ctype = "double" if suffix in ("pd", "sd") else "float"
+        packed = suffix in ("ps", "pd")
+        # 132 → DEST*SRC2+SRC1, 213 → SRC1*DEST+SRC2, 231 → SRC1*SRC2+DEST.
+        first, second, addend = {"132": (dst, s2, s1),
+                                 "213": (s1, dst, s2),
+                                 "231": (s1, s2, dst)}[order]
+        call = {"fmadd": "_mm_fmadd_", "fmsub": "_mm_fmsub_",
+                "fnmadd": "_mm_fnmadd_", "fnmsub": "_mm_fnmsub_"}[kind] + suffix
+
+        def at(op):
+            if op.type == capstone.x86.X86_OP_MEM:
+                return f"(const {ctype} *)(uintptr_t){addr(op, insn)}"
+            return f"(const {ctype} *)((const char *){lane(vec(op)[0])})"
+
+        lines = ["{"]
+        vtype = "__m128" if ctype == "float" else "__m128d"
+        if packed:
+            load = "_mm_loadu_ps" if ctype == "float" else "_mm_loadu_pd"
+            store = "_mm_storeu_ps" if ctype == "float" else "_mm_storeu_pd"
+            lines.append(f"    const {ctype} *pa = {at(first)};")
+            lines.append(f"    const {ctype} *pb = {at(second)};")
+            lines.append(f"    const {ctype} *pc = {at(addend)};")
+            # 256 位用两次 128 位：融合发生在每一个通道内部，两个半边的结果拼起来
+            # 与一条 256 位指令逐位相同。三个源都在同一个偏移上先读完再写回，
+            # 所以目标与某个源重合（编译器最常发的形态）也是对的。
+            lines.append(f"    for (unsigned off = 0; off < {width}u; off += 16u) {{")
+            lines.append(f"        {vtype} x = {load}((const {ctype} *)((const char *)pa + off));")
+            lines.append(f"        {vtype} y = {load}((const {ctype} *)((const char *)pb + off));")
+            lines.append(f"        {vtype} z = {load}((const {ctype} *)((const char *)pc + off));")
+            lines.append(f"        {store}(({ctype} *)((char *){lane(index)} + off), "
+                         f"{call}(x, y, z));")
+            lines.append("    }")
+        else:
+            load = "_mm_load_ss" if ctype == "float" else "_mm_load_sd"
+            poke = "_mm_cvtss_f32" if ctype == "float" else "_mm_cvtsd_f64"
+            step = 4 if ctype == "float" else 8
+            # 只读低一个元素：标量形式的 r/m 操作数在内存里只有 4/8 字节，
+            # 整寄存器宽度地去读会越过它所在的页。
+            lines.append(f"    {vtype} x = {load}({at(first)});")
+            lines.append(f"    {vtype} y = {load}({at(second)});")
+            lines.append(f"    {vtype} z = {load}({at(addend)});")
+            lines.append(f"    {ctype} d = {poke}({call}(x, y, z));")
+            # 标量形式只盖低 4/8 字节，`127:32` 留着目标自己的原值。这一条是硬件
+            # 定的，不是从文档推的：`vfmadd132ss xmm3, xmm1, xmm1`、`vfmadd231ss
+            # xmm1, xmm0, xmm0`、`vfmadd213ss xmm2, xmm3, xmm5` 三个用例里，结果
+            # 的 `127:32` 都等于目标原值而与 SRC1 无关（片段差分把它们逐个指了出来）。
+            lines.append(f"    memcpy({lane(index)}, &d, {step});")
+        if width == 16 and vex:
+            lines += ["    " + z for z in upper_zeroed(index)]
+        lines.append("}")
         return lines
 
     if stem in VEC_FLOAT:
@@ -1100,11 +1691,14 @@ def vec_line(insn):
     if stem in ("cvttss2si", "cvttsd2si"):
         # 向零截断。源是 NaN 或超出目标范围时结果是"整数不定值"（只有符号位），
         # C 的强制转换在那里是未定义行为，所以边界写成显式比较。
-        if len(ops) != 2 or is_vec(ops[0]) or not is_vec(ops[1]):
+        if len(ops) != 2:
             raise Refused(f"{m} form")
         step = 4 if stem == "cvttss2si" else 8
-        out_bits = ops[0].size * 8  # `width` the name is taken by the register width here
         source = float_operand(ops[1], step, insn)
+        # 目标也可以是向量寄存器：结果落在低 4/8 字节，其余清零（VEX 的 128 位
+        # 形式连 255:128 一起清）。
+        into_vec = is_vec(ops[0])
+        out_bits = step * 8 if into_vec else ops[0].size * 8
         lines = ["{", f"    double x = (double)({source});"]
         if out_bits == 32:
             lines.append("    int64_t v = (x > -2147483649.0 && x < 2147483648.0)"
@@ -1112,7 +1706,14 @@ def vec_line(insn):
         else:
             lines.append("    int64_t v = (x < 9223372036854775808.0)"
                          " ? (int64_t)x : INT64_MIN;")
-        lines.append(f"    {wr(ops[0], '((uint64_t)v)', insn)}")
+        if into_vec:
+            index, dwidth = vec(ops[0])
+            lines.append(f"    memset({lane(index)}, 0, {dwidth}u);")
+            lines.append(f"    memcpy({lane(index)}, &v, {step});")
+            if dwidth == 16 and vex:
+                lines += ["    " + z for z in upper_zeroed(index)]
+        else:
+            lines.append(f"    {wr(ops[0], '((uint64_t)v)', insn)}")
         lines.append("}")
         return lines
 
@@ -1138,6 +1739,58 @@ def vec_line(insn):
             lines.append(f"    memcpy({lane(index)}, {lane(vec(a)[0])}, {width});")
         for n in range(lanes):
             lines.append(f"    memcpy((char *){lane(index)} + {step * n}, &d{n}, {step});")
+        if width == 16 and vex:
+            lines += ["    " + z for z in upper_zeroed(index)]
+        lines.append("}")
+        return lines
+
+    if stem in VEC_ROUND:
+        step, packed = VEC_ROUND[stem]
+        ctype = "double" if step == 8 else "float"
+        if packed:
+            if len(ops) != 3:
+                raise Refused(f"{m} arity")
+            dst, source, sel = ops
+            a = None
+        elif len(ops) == 4:
+            dst, a, source, sel = ops
+        elif len(ops) == 3:
+            dst, a, source, sel = ops[0], None, ops[1], ops[2]
+        else:
+            raise Refused(f"{m} arity")
+        if not is_vec(dst) or sel.type != capstone.x86.X86_OP_IMM:
+            raise Refused(f"{m} form")
+        index, width = vec(dst)
+        mode = f"{ROUND_MODE[sel.imm & 3]} | _MM_FROUND_NO_EXC"
+        if source.type == capstone.x86.X86_OP_MEM:
+            sp = f"(const {ctype} *)(uintptr_t){addr(source, insn)}"
+        else:
+            sp = f"(const {ctype} *)((const char *){lane(vec(source)[0])})"
+        load = "_mm_loadu_ps" if ctype == "float" else "_mm_loadu_pd"
+        store = "_mm_storeu_ps" if ctype == "float" else "_mm_storeu_pd"
+        lines = ["{"]
+        vtype = "__m128" if ctype == "float" else "__m128d"
+        if packed:
+            lines.append(f"    const {ctype} *ps = {sp};")
+            lines.append(f"    for (unsigned off = 0; off < {width}u; off += 16u) {{")
+            lines.append(f"        {vtype} x = {load}((const {ctype} *)((const char *)ps + off));")
+            lines.append(f"        {store}(({ctype} *)((char *){lane(index)} + off), "
+                         f"_{'mm_round_ps' if ctype == 'float' else 'mm_round_pd'}(x, {mode}));")
+            lines.append("    }")
+        else:
+            lp = "_mm_load_ss" if ctype == "float" else "_mm_load_sd"
+            lp2 = lp
+            poke = "_mm_cvtss_f32" if ctype == "float" else "_mm_cvtsd_f64"
+            rnd = "_mm_round_ss" if ctype == "float" else "_mm_round_sd"
+            # 标量形式只算低一个元素：源的 r/m 形式在内存里只有 4/8 字节。
+            if a is None or vec(a)[0] == index:
+                ap = f"({ctype} *)((const char *){lane(index)})"
+            else:
+                ap = f"({ctype} *)((const char *){lane(vec(a)[0])})"
+            lines.append(f"    {ctype} d = {poke}({rnd}({lp}({ap}), {lp2}({sp}), {mode}));")
+            if a is not None and vec(a)[0] != index:
+                lines.append(f"    memcpy({lane(index)}, {lane(vec(a)[0])}, {width}u);")
+            lines.append(f"    memcpy({lane(index)}, &d, {step});")
         if width == 16 and vex:
             lines += ["    " + z for z in upper_zeroed(index)]
         lines.append("}")
@@ -1194,7 +1847,7 @@ def vec_line(insn):
                 raise Refused(f"{m} arity")
             if sel.type != capstone.x86.X86_OP_IMM:
                 raise Refused(f"{m} without a predicate")
-            pred = sel.imm & 7
+            pred = sel.imm & 31
         if not is_vec(dst):
             raise Refused(f"{m} to memory")
         form = VEC_CMP_FLOAT[pred]
@@ -1467,6 +2120,43 @@ def lift_one(insn):
             "    " + wr(ops[0], "r0", insn),
             "}",
         ]
+    if m == "popcnt":
+        # 数一数 1 的个数。`_popcnt64`/`_popcnt32` 就是这条指令（SSE4.2 的 POPCNT），
+        # 目标宽度决定用哪一个；8/16 位操作数在硬件上也是按 16/32 位算的。
+        if len(ops) != 2:
+            raise Refused("popcnt arity")
+        bits = width(ops[0])
+        # 只数到操作数宽度为止：8/16 位的 `popcnt` 在硬件上也算 16/32 位的值，
+        # 而写回时 `wr` 会截断，所以先把源遮到它自己的宽度。
+        mask = ONES[bits] if bits < 64 else None
+        val = f"((uint64_t){src(ops[1], insn)})"
+        if mask:
+            val = f"(({val}) & {mask})"
+        return [wr(ops[0], f"popcount64({val})", insn)]
+    if m == "rorx":
+        # 循环右移但**不碰标志**。移 0 位时 C 的 `x >> 64` 是未定义行为，所以
+        # 移位数单独分支写出来，与指令的"原样返回"对齐。
+        if len(ops) != 3 or ops[2].type != capstone.x86.X86_OP_IMM:
+            raise Refused("rorx arity")
+        bits = width(ops[0])
+        n = ops[2].imm & (bits - 1)
+        if n == 0:
+            return [wr(ops[0], src(ops[1], insn), insn)]
+        return [wr(ops[0], f"((((uint{bits}_t){src(ops[1], insn)}) >> {n}) | "
+                           f"(((uint{bits}_t){src(ops[1], insn)}) << {bits - n}))", insn)]
+    if m == "bzhi":
+        # BMI2: 从第 index 位起的高位清零。`_bzhi_u32/_u64` 就是这条指令，
+        # 包括 index 大于等于宽度时"原样不动"与 index 为 0 时"全零"两个边界。
+        if len(ops) != 3:
+            raise Refused("bzhi arity")
+        bits = width(ops[0])
+        if bits == 64:
+            call = (f"_bzhi_u64((uint64_t){src(ops[1], insn)}, "
+                    f"(unsigned){src(ops[2], insn)})")
+        else:
+            call = (f"_bzhi_u32((unsigned)(uint32_t){src(ops[1], insn)}, "
+                    f"(unsigned)(uint32_t){src(ops[2], insn)})")
+        return [wr(ops[0], call, insn)]
     if m in ("div", "idiv"):
         # The one-operand form divides RDX:RAX and leaves quotient in RAX and
         # remainder in RDX — a 128-by-64 division no C operator performs. MSVC's
@@ -2026,6 +2716,7 @@ def main():
     csrc = os.path.join(work, "lifted.c")
     head = ("#include <stdint.h>\n#include <stdio.h>\n#include <string.h>\n"
             "#include <math.h>\n#include <intrin.h>\n"
+            "#include <xmmintrin.h>\n#include <immintrin.h>\n"
             "static uint64_t v[16][4];\n" + "\n".join(HELPERS) + "\n")
     whole = head + "\n".join(image_loader(pe)) + "\n" + "\n".join(body) + "\n" + driver
     with open(csrc, "w", encoding="utf-8") as f:

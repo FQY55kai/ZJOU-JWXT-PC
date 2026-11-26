@@ -36,3 +36,16 @@ X2W 是目前**唯一**明确自述"x64 机器码 → C++ 静态重编译"并持
 - [ ] `flags.py`：直线段内的生产者→消费者标志位模型，覆盖 `Jcc`/`SETcc`/`CMOVcc`，含 8/16 位窄算术的 OF/PF
 - [ ] `switch.py`：两种跳转表模式 → `switch`，`B` 同址与索引可证的检查照抄
 - [ ] 差分比较加上"被写内存页的哈希"，不只比 16 个寄存器与 256 字节栈
+
+## 读上游这一轮（`e4e2b46d..a6967446`）：只有一条提交，且不在 CPU 侧
+
+| 提交 | 内容 | 能不能吸收 |
+|---|---|---|
+| `a6967446` | `cpu: harden atomic writes, path validation, and subprocess error handling in exe_aot with CLI suite (#2605)`——`exe_aot.py` 改成 `os.replace` 原子落盘、路径校验、子进程错误传播，附带约 750 行的 CLI 测试套件 | **没有指令语义**。原子落盘这一条本仓库早就在做：差分前先写一份 `snippets.exe` 副本、从不改原件（`tools/diff.py` 的 `snippets()`），正是同一个原因——半写好的文件会让下一次运行拿到一个既不是原版也不是补丁版的映像 |
+
+值得一提的对照：它这一轮把力气花在 **CLI 的健壮性**上，我们的对应物是 `diff.py` 的
+`--keep` 与逐例故障恢复——**"裁判自己不能先坏"** 是两棵树共同的结论，只是落点不同。
+
+上一轮读过、这一轮仍然成立的差异：上游按指令族拆成十几个 `cpu_*_aot.py`，本仓库只有一个 `lift.py`。
+本轮 `vec_line` 又长出 `VEC_APPROX`/`FMA`/`VEC_ROUND`/`VEC_EXTEND`/`VEC_PACK` 五张表，
+**拆分的判据已经压到桌面上**（见 README §7 末段）。

@@ -161,6 +161,26 @@ SNIPPETS = [
     ("vinsertps", ""), ("vmovshdup", ""), ("vmovsldup", ""), ("vmovddup", ""),
     ("vblendps", ""), ("vpblendd", ""), ("vpblendw", ""),
     ("vcmpeqps", ""), ("vcmpltps", ""), ("vcmplepd", ""),
+    # AVX 把立即数从三位扩到五位：多出来的十六个是同样八个关系换一种
+    # quiet/signaling 配对，再加 ge/gt/false/true。这一组盯的是名字解析得对不对。
+    ("vcmplt_oqps", ""), ("vcmpgt_oqps", ""), ("vcmpeq_uqps", ""),
+    ("vcmpnge_usps", ""), ("vcmptrue_usps", ""), ("vcmpfalse_oqps", ""),
+    ("vcmplt_oqss", ""), ("vcmpngt_uqss", ""),
+    # 取整：四个方向 × 打包/标量，imm[1:0] 换方向，标量还要盯住上半部分
+    ("vroundps", ""), ("vroundpd", ""), ("vroundss", ""), ("vroundsd", ""),
+    # 元素扩展、半寄存器合并、单元素抽出
+    ("vpmovsxbq", ""), ("vpmovzxbd", ""), ("vpmovsxwd", ""),
+    ("vmovlhps", ""), ("vextractps", ""),
+    # 饱和打包：夹到目标宽度，四种符号/宽度组合各一条
+    ("vpackssdw", ""), ("vpacksswb", ""), ("vpackuswb", ""), ("vpackusdw", ""),
+    # 半精度转换、双字重排、抽一个字节、BMI2 的截断
+    ("vcvtps2ph", ""), ("vcvtph2ps", ""), ("vpshufd", ""), ("vpextrb", ""),
+    ("bzhi", ""), ("vpextrw", ""), ("vextracti128", ""),
+    ("vpinsrd", ""), ("vpermilps", ""), ("vpextrd", ""),
+    ("vcvtss2sd", ""), ("vpshufb", ""),
+    ("bts", ("cf",)), ("btr", ("cf",)),
+    ("popcnt", ("cf", "zf", "sf", "of")), ("rorx", ""),
+    ("vinserti128", ""), ("vpshuflw", ""), ("vpshufhw", ""), ("vhsubps", ""),
     ("vpcmpgtb", ""), ("vpcmpgtw", ""),
     ("vshufps", ""), ("vshufpd", ""), ("vunpcklps", ""), ("vpunpckhwd", ""),
     ("vhaddps", ""), ("vhaddpd", ""),
@@ -168,14 +188,29 @@ SNIPPETS = [
     ("vpsrad", ""), ("vpslld", ""), ("vpsrlq", ""), ("vpsllw", ""),
     ("vpsubb", ""), ("vpaddw", ""),
     ("vsqrtps", ""), ("vsqrtss", ""), ("vsqrtsd", ""),
+    # 近似指令：只能靠"执行同一条指令"相等，所以这一组是 intrinsic 那条路唯一的
+    # 证据——两个 128 位半边是否真与一条 256 位相同，硬件说了算。
+    ("vrsqrtps", ""), ("vrsqrtss", ""), ("vrcpps", ""), ("vrcpss", ""),
+    # 融合乘加：`a*b+c` 在 C 里舍入两次，指令只舍入一次，所以只有 intrinsic 能对上。
+    # 三个数字（132/213/231）换的是"哪个操作数是被乘数"，四种前缀（add/sub/nmadd/
+    # nmsub）换的是符号，打包/标量换的是宽度与 `127:32` 的来处，都得各试一遍。
+    ("vfmadd132ps", ""), ("vfmadd213ps", ""), ("vfmadd231ps", ""),
+    ("vfmsub213ps", ""), ("vfnmadd213ps", ""), ("vfnmadd231ps", ""),
+    ("vfnmsub231ps", ""), ("vfmadd213pd", ""),
+    ("vfmadd132ss", ""), ("vfmadd213ss", ""), ("vfmadd231ss", ""),
+    ("vfmsub213ss", ""), ("vfnmadd213ss", ""), ("vfmadd213sd", ""),
     ("vcvttss2si", ""), ("vcvttsd2si", ""),
     # 只通过标志说话的：结果不落在任何寄存器，四个 setcc 就是全部可观测输出
     ("vtestps", ("cf", "zf")), ("vtestpd", ("cf", "zf")),
+    ("vptest", ("cf", "zf")),
     # 整数侧：BMI1 位提取与计数、旋转、以及比较本身（czso 会走到这一轮新加的
     # js/jns 与 jo/jno 两条路径）
     ("tzcnt", ""), ("lzcnt", ""), ("blsr", ""), ("blsi", ""),
     ("rol", ""), ("ror", ""),
     ("cmp", ("cf", "zf", "sf", "of")),
+    # 四个标志全读一遍：`add`/`sub` 的 CF 与 OF 是这一轮新算出来的，只读 ZF 看不出对错
+    ("add", ("cf", "zf", "sf", "of")), ("sub", ("cf", "zf", "sf", "of")),
+    ("and", ("cf", "zf", "sf", "of")), ("xor", ("cf", "zf", "sf", "of")),
 ]
 
 
@@ -255,6 +290,13 @@ def snippets(exe, work):
             # sides and prove nothing.
             if not reachable(bytes(insn.bytes), 0):
                 continue
+            # 片段以 `ret` 结尾，而 `ret` 用的是 rsp：任何写 rsp 的指令（最典型的是
+            # 函数序言里的 `add rsp, 0x28`）都会把返回地址指到别处，两侧一起崩，
+            # 这一类就什么也证明不了。换一个不碰栈的实例。
+            first = insn.operands[0] if insn.operands else None
+            if (first is not None and first.type == capstone.x86.X86_OP_REG
+                    and lift.MD.reg_name(first.reg) in ("rsp", "esp", "sp")):
+                continue
             found[insn.mnemonic] = bytes(insn.bytes)
         if len(found) == len(wanted):
             break
@@ -281,6 +323,12 @@ def snippets(exe, work):
             refused.append((name, "lifted to nothing"))
             continue
         pieces.append((name, code, lines))
+        if os.environ.get("DIFF_DUMP") and name in os.environ["DIFF_DUMP"].split(","):
+            one = lift.MD.disasm(body, 0)
+            for i in one:
+                print(f"  [{name}] {i.mnemonic} {i.op_str}  {body.hex()}")
+            for l in lines:
+                print("     ", l)
 
     # Sixteen-byte starts, packed: the run has to fit in a gap between two
     # `.pdata` ranges, and gaps in a stripped `.text` are hundreds of bytes, not
@@ -314,6 +362,10 @@ def snippets(exe, work):
         print(f"  {name:14s} skipped: {why}")
     print(f"  {len(rows)} snippets in {at} bytes at {slots:#x}, "
           f"image patched to {os.path.basename(path)}")
+    if os.environ.get("DIFF_DUMP"):
+        for rva, name, _, _ in rows:
+            if name in os.environ["DIFF_DUMP"].split(","):
+                print(f"    {rva:#x} {name}")
     return path, [(rva, code, lines) for rva, _, code, lines in rows], \
         {rva: name for rva, name, _, _ in rows}
 
@@ -324,7 +376,9 @@ def emit(kept, path, pe):
     outer = externals(kept)
     names = sorted({rva for rva, _, _ in kept} | outer)
     lines = ["#include <stdint.h>", "#include <stdio.h>", "#include <string.h>",
-             "#include <math.h>", "#include <intrin.h>", "#include <setjmp.h>"]
+             "#include <math.h>", "#include <intrin.h>", "#include <xmmintrin.h>",
+             "#include <immintrin.h>",
+             "#include <setjmp.h>"]
     lines += lift.HELPERS
     lines += lift.image_loader(pe)
     lines += [
@@ -687,7 +741,7 @@ def main():
             port.extend(isolate(lambda i, o: [exe, i, o, args.exe], read_port,
                                 slice_, work, "p" + tag, args.timeout))
         for i, case in enumerate(cases):
-            records.append((case[0], expected[i], port[i]))
+            records.append((case[0], expected[i], port[i], case[4]))
             if expected[i] is None:
                 faulted_both.add(case[0])
             elif port[i] is None or not port[i]["ran"]:
@@ -696,7 +750,7 @@ def main():
 
     bad, checked, shown, apart = 0, 0, 0, 0
     per_name = {}
-    for rva, want, mine in records:
+    for rva, want, mine, vin in records:
         if want is None or mine is None or not mine["ran"]:
             continue
         # The `call` that starts the run pushed a return address at `rsp - 8`,
@@ -731,6 +785,12 @@ def main():
                 if got_vec != want[2]:
                     at = [f"x{off // 32}[{(off % 32) // 8}]" for off in range(0, VEC_BYTES, 8)
                           if got_vec[off:off + 8] != want[2][off:off + 8]][:4]
+                    if os.environ.get("DIFF_DUMP"):
+                        at = [f"x{off // 32}[{(off % 32) // 8}] hw={want[2][off:off + 8].hex()}"
+                              f"/c={got_vec[off:off + 8].hex()}"
+                              f"/in={bytes(vin[off // 32 * 32:off // 32 * 32 + 32]).hex()}"
+                              for off in range(0, VEC_BYTES, 8)
+                              if got_vec[off:off + 8] != want[2][off:off + 8]][:4]
                     clash.append("vector at " + ", ".join(at))
                 print(f"  {rva:#x}: " + ", ".join(clash))
     print(f"functions: {len(kept)} runnable, {len(kept) - len(faulted_both) - len(faulted_port)} "

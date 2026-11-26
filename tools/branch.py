@@ -71,7 +71,7 @@ EQUALITY = {"e": "==", "ne": "!="}
 # carry and signed overflow, not the comparison the condition names — so only
 # e/ne/s/ns may read these.
 FLAG_FROM_RESULT = {"add", "sub", "and", "or", "xor", "inc", "dec", "neg",
-                    "andn", "bextr", "xadd", "blsi", "blsmsk", "blsr"}
+                    "andn", "bextr", "xadd", "blsi", "blsmsk", "blsr", "popcnt"}
 
 # The vector unit's moves and bitwise ops. None of them write the arithmetic
 # flags — the ones that do (`ucomiss`, `ptest`) are not translated at all — so a
@@ -160,8 +160,64 @@ def condition(pending, suffix):
             return f"((({a}) >> {bits - 1}) & 1)"
         if suffix == "ns":
             return f"!((({a}) >> {bits - 1}) & 1)"
-        # Carry, overflow and parity after an ALU op are not the comparison the
-        # condition names (`jb` after `add` reads the carry-out).
+        # 进位与溢出：`add`/`sub` 的 CF 是"结果往回退不回去"，OF 是两个源与结果的
+        # 符号位组合。手头只有结果和**源**操作数，但另一个操作数可以从这两者反推：
+        # `add` 的被加数是 `结果 - 源`，`sub` 的被减数是 `结果 + 源`（都在模 2^bits
+        # 下）。所以不必在 ALU 之前多存一份目标值。
+        if b is None:
+            raise Refused(f"alu result only for zf/sf, not {suffix}")
+        opk, bv = b
+        u = f"uint{bits}_t"
+        zf = f"(({a}) == 0)"
+        sign = f"((({a}) >> {bits - 1}) & 1)"
+        if opk == "add":
+            av = f"(({u})(({a}) - ({bv})))"
+            cf = f"((({u})({a})) < ({av}))"
+            of = f"((((({av}) ^ ({a})) & (({bv}) ^ ({a}))) >> {bits - 1}) & 1)"
+        elif opk == "sub":
+            av = f"(({u})(({a}) + ({bv})))"
+            cf = f"((({av}) < ({u})({bv})))"
+            of = f"((((({av}) ^ ({bv})) & (({av}) ^ ({a}))) >> {bits - 1}) & 1)"
+        elif opk == "inc":
+            # `inc`/`dec` 不碰 CF，所以凡是要进位的条件都没法回答；溢出则仍是结果的
+            # 事：加一溢出当且仅当结果是最小值，减一溢出当且仅当结果是最大值。
+            cf = None
+            of = f"((({a}) == (({u})1 << {bits - 1})) ? 1 : 0)"
+        elif opk == "dec":
+            cf = None
+            of = f"((({a}) == ((({u})~0) >> 1)) ? 1 : 0)"
+        elif opk == "zero":
+            # `popcnt` 只让 ZF 跟着结果走，其余三位一律清零。
+            cf = "0"
+            of = "0"
+        else:
+            # 逻辑运算把 CF 与 OF 清零，所以进位条件成了常量。
+            cf = "0"
+            of = "0"
+        if suffix in ("c", "b", "nc", "ae", "be", "a", "nbe") and cf is None:
+            raise Refused(f"{opk} keeps the carry, so {suffix} is not the result's")
+        if suffix == "o":
+            return of if opk != "logic" else "0"
+        if suffix == "no":
+            return f"!({of})" if opk != "logic" else "1"
+        if suffix in ("c", "b"):
+            return cf
+        if suffix in ("nc", "ae"):
+            return f"!({cf})"
+        if suffix == "be":
+            return f"(({cf}) || {zf})"
+        if suffix in ("a", "nbe"):
+            return f"(!({cf}) && !{zf})" if opk != "logic" else f"(!{zf})"
+        if opk == "zero":
+            sign = "0"
+        if suffix in ("l", "nge"):
+            return f"({sign} != ({of}))"
+        if suffix in ("ge", "nl"):
+            return f"({sign} == ({of}))"
+        if suffix in ("le", "ng"):
+            return f"({zf} || ({sign} != ({of})))"
+        if suffix in ("g", "nle"):
+            return f"(!{zf} && ({sign} == ({of})))"
         raise Refused(f"alu result only for zf/sf, not {suffix}")
     if kind == "test":
         if suffix == "e":
@@ -448,6 +504,173 @@ def walk(code, rva):
     return insns, starts, calls, dispatches
 
 
+def alu_shape(mnemonic):
+    """How an ALU op produces CF/OF, or None when this model cannot say.
+
+    `add` 与 `sub` 的进位方向相反，逻辑运算把两位都清零，其余（`inc`/`dec` 不动
+    CF，`blsi`/`bextr`/`andn` 从别处取 CF）不在这条规则的覆盖里——认不出来就退回
+    只支持 ZF/SF，而不是给一个看着像的答案。
+    """
+    m = mnemonic[5:] if mnemonic.startswith("lock ") else mnemonic
+    if m in ("add", "xadd"):
+        return "add"
+    if m == "sub":
+        return "sub"
+    if m in ("and", "or", "xor"):
+        return "logic"
+    if m == "popcnt":
+        return "zero"       # CF/OF/SF 全清，只有 ZF 是结果的事
+    if m == "inc":
+        return "inc"
+    if m == "dec":
+        return "dec"
+    return None
+
+
+def flag_step(pending, insn):
+    """What `insn` leaves behind for the flags: a token, or None.
+
+    Mirrors the bookkeeping inside `lift_function`, and exists separately so the
+    block dataflow below can run *before* anything is emitted. The tokens name
+    their operands by the address of the producing instruction (`pa_<at>`), not
+    by a running counter, so a consumer three blocks away can name them too.
+    """
+    m = insn.mnemonic
+    at = insn.address
+    if m.startswith("lock "):
+        m = m[5:]
+    if m == "cmpxchg":
+        return ("cmp", f"pa_{at:x}", f"pb_{at:x}", module.width(insn.operands[0]))
+    if m == "cmp":
+        return ("cmp", f"pa_{at:x}", f"pb_{at:x}", insn.operands[0].size * 8)
+    if m == "test":
+        return ("test", f"pa_{at:x}", "0", insn.operands[0].size * 8)
+    if m in module.FLOAT_COMPARE:
+        return ("fcom", f"pf_{at:x}", f"pg_{at:x}", module.FLOAT_COMPARE[m] * 8)
+    if m in ("ptest", "vptest", "vtestps", "vtestpd"):
+        return ("vtest", f"pz_{at:x}", f"pc_{at:x}", 64)
+    if m == "bt":
+        return ("cf", f"pb_{at:x}", None, module.width(insn.operands[0]))
+    if m in ("rol", "ror"):
+        # A rotate writes CF and OF and keeps the rest, so equality and the sign
+        # are still the compare's; carry and the signed ordering are not.
+        if pending is None:
+            return None
+        if pending[0] in ("cmp", "test"):
+            return ("cmp_nocf",) + tuple(pending[1:])
+        return pending if pending[0] == "alu" else None
+    if m.startswith("set"):
+        return pending           # reads a flag, writes a byte
+    if m.startswith("cmov"):
+        return pending           # reads the flags and writes a register
+    if m == "call":
+        return None              # a call does not preserve them
+    if m in ("bts", "btr", "btc"):
+        # 改一位并把改动前的那一位送进 CF，其余标志不动——与 `bt` 同一个 token。
+        if not insn.operands or insn.operands[0].type != capstone.x86.X86_OP_REG:
+            return None
+        return ("cf", f"pcb_{at:x}", None, module.width(insn.operands[0]))
+    if m in ("adc", "sbb", "rcl", "rcr"):
+        return None              # refused later, with the instruction's name
+    if m.startswith("j") or m == "ret" or m == "retf":
+        return pending           # a branch reads the flags and writes none
+    if m not in FLAG_SAFE and not flag_neutral(m):
+        return None
+    if m in FLAG_FROM_RESULT:
+        shape = alu_shape(m)
+        if shape is not None and len(insn.operands) < 2 and shape not in ("inc", "dec"):
+            shape = None
+        # `inc`/`dec` 只有一个操作数，条件里也从不读第二个源，占位写 "1"。
+        bv = f"pb_{at:x}" if len(insn.operands) >= 2 else "1"
+        return ("alu", f"pa_{at:x}", (shape, bv) if shape else None,
+                module.width(insn.operands[0]))
+    return pending
+
+
+def flag_flow(insns, block_starts, preds, rva):
+    """The pending token at each block entry, from the entry block onwards.
+
+    A block inherits the flags of its predecessor only when it has exactly one
+    way in: with two, the paths may have left different flags and choosing one
+    is a guess. This is what a linear scan cannot do — `cmp eax,3 / jae L1 /
+    … / L1: jne L0` puts the merge point *between* the compare and the branch
+    that reads it, so the linear state is gone by the time the branch arrives,
+    even though the branch itself has a single way in.
+    """
+    starts = set(block_starts)
+    owner, cur = {}, None
+    for at in sorted(insns):
+        if at in starts:
+            cur = at
+        owner[at] = cur
+    pending_in = {b: None for b in block_starts}
+    settled = False
+    for _ in range(len(block_starts) + 2):
+        out, prev = {}, {}
+        for at in sorted(insns):
+            b = owner[at]
+            seed = pending_in[b] if at == b else prev.get(b)
+            prev[b] = flag_step(seed, insns[at])
+            out[at] = prev[b]
+        changed = set()
+        for b in block_starts:
+            if b == rva:
+                continue
+            comes = preds.get(b)
+            if not comes or len(comes) != 1:
+                continue
+            want = out.get(next(iter(comes)))
+            if want != pending_in[b]:
+                pending_in[b] = want
+                changed.add(b)
+        if not changed:
+            settled = True
+            break
+    if not settled:
+        # A cycle that never settles: the flags at its entry depend on the
+        # iteration, so there is no answer here. Refusing to choose is the only
+        # honest option left.
+        for b in block_starts:
+            pending_in[b] = None
+    return pending_in
+
+
+def predecessors(insns, dispatches):
+    """(target -> {source addresses}) over the edges this function has.
+
+    `walk` knows which addresses are entered by an edge but not by whom, and the
+    difference matters for the flags: a label with one way in can inherit the
+    flags of the instruction that leads to it, a label with two cannot — the two
+    paths may have left different flags behind, and picking either one is a
+    guess that a differential test would have to catch later, at run time, on
+    some input nobody chose.
+    """
+    preds = {}
+    for at, insn in insns.items():
+        m = insn.mnemonic
+        nxt = at + insn.size
+        if m in ("ret", "retf"):
+            continue
+        if at in dispatches:
+            # Every case of the table is an edge in, so the cases are merged
+            # points by construction.
+            for case in dispatches[at]["entries"]:
+                preds.setdefault(case, set()).add(at)
+            continue
+        if m == "jmp":
+            op = insn.operands[0] if insn.operands else None
+            if op is not None and op.type == capstone.x86.X86_OP_IMM:
+                preds.setdefault(op.imm, set()).add(at)
+            continue
+        if m.startswith("j"):
+            op = insn.operands[0]
+            if op.type == capstone.x86.X86_OP_IMM:
+                preds.setdefault(op.imm, set()).add(at)
+        if nxt in insns:
+            preds.setdefault(nxt, set()).add(at)
+    return preds
+
+
 def lift_function(code, rva):
     """C statements for a function with branches, or Refused."""
     insns, starts, calls, dispatches = walk(code, rva)
@@ -455,8 +678,14 @@ def lift_function(code, rva):
         raise Refused("empty")
     start, end = rva, rva + len(code)
 
+    preds = predecessors(insns, dispatches)
+    block_starts = sorted(set(starts) | {rva})
+    arriving = flag_flow(insns, block_starts, preds, rva)
+
     out = []
-    # `cmp`/`test` seen but not yet consumed by a branch: the operands as C.
+    # `cmp`/`test` seen but not yet consumed by a branch: the operands as C,
+    # and the address of the instruction that produced them — a label may only
+    # inherit them when that producer is at or before its one and only way in.
     pending = None
     # Comparands are snapshotted into locals at the compare, because a
     # flag-neutral `mov` in between can overwrite a register the compare read:
@@ -464,9 +693,11 @@ def lift_function(code, rva):
     snap = 0
     for at in sorted(insns):
         insn = insns[at]
-        # A run that an edge enters cannot borrow the flags of the run before it.
+        # A run that an edge enters cannot borrow the flags of the run before
+        # it; it takes the ones the dataflow says arrive here, which is a token
+        # only where every way in left the same compare behind.
         if at in starts:
-            pending = None
+            pending = arriving.get(at)
             out.append(f"L{at:#x}: ;")
         m, ops = insn.mnemonic, insn.operands
         if m.startswith("lock "):
@@ -500,19 +731,22 @@ def lift_function(code, rva):
             bits = module.width(ops[0])
             wide = f"uint{bits}_t"
             snap += 1
-            out.append(f"{wide} o{snap} = {module.src(ops[0], insn)};")
+            # The flag operands are named after the address of the instruction
+            # that produced them, not after a running counter: a consumer in
+            # another block has to name them before this block is emitted.
+            out.append(f"{wide} pa_{at:x} = {module.src(ops[0], insn)};")
             out.append(f"{wide} v{snap} = {module.src(ops[1], insn)};")
-            out.append(f"{wide} x{snap} = (uint{bits}_t)r[0];")
+            out.append(f"{wide} pb_{at:x} = (uint{bits}_t)r[0];")
             if bits == 64:
-                back = f"r[0] = (uint64_t)o{snap};"
+                back = f"r[0] = (uint64_t)pa_{at:x};"
             elif bits == 32:
-                back = f"r[0] = (uint64_t)(uint32_t)o{snap};"
+                back = f"r[0] = (uint64_t)(uint32_t)pa_{at:x};"
             else:
                 mask = module.ONES[bits]
-                back = f"r[0] = (r[0] & ~{mask}) | ((uint64_t)o{snap} & {mask});"
-            out.append(f"if (x{snap} == o{snap}) {module.wr(ops[0], f'v{snap}', insn)}"
+                back = f"r[0] = (r[0] & ~{mask}) | ((uint64_t)pa_{at:x} & {mask});"
+            out.append(f"if (pb_{at:x} == pa_{at:x}) {module.wr(ops[0], f'v{snap}', insn)}"
                        f" else {back}")
-            pending = ("cmp", f"o{snap}", f"x{snap}", bits)
+            pending = ("cmp", f"pa_{at:x}", f"pb_{at:x}", bits)
             continue
         if m in ("cmp", "test"):
             snap += 1
@@ -523,12 +757,12 @@ def lift_function(code, rva):
                 # "非零即真"，方向正好反了。截到操作数宽度再与，符号位与奇偶位随之正确。
                 bits = ops[0].size * 8
                 wide = f"uint{bits}_t"
-                out.append(f"uint64_t a{snap} = (uint64_t)"
+                out.append(f"uint64_t pa_{at:x} = (uint64_t)"
                            f"(({wide})({a}) & ({wide})({b}));")
-                pending = ("test", f"a{snap}", "0", bits)
+                pending = ("test", f"pa_{at:x}", "0", bits)
             else:
-                out.append(f"uint64_t a{snap} = {a}, b{snap} = {b};")
-                pending = ("cmp", f"a{snap}", f"b{snap}", ops[0].size * 8)
+                out.append(f"uint64_t pa_{at:x} = {a}, pb_{at:x} = {b};")
+                pending = ("cmp", f"pa_{at:x}", f"pb_{at:x}", ops[0].size * 8)
             continue
         if m in module.FLOAT_COMPARE:
             # The two low lanes, snapshotted as C floats: a `mov` between the
@@ -538,11 +772,11 @@ def lift_function(code, rva):
             snap += 1
             size = module.FLOAT_COMPARE[m]
             ctype = "float" if size == 4 else "double"
-            out.append(f"{ctype} f{snap} = {module.float_operand(ops[0], size, insn)}"
-                       f", g{snap} = {module.float_operand(ops[1], size, insn)};")
-            pending = ("fcom", f"f{snap}", f"g{snap}", size * 8)
+            out.append(f"{ctype} pf_{at:x} = {module.float_operand(ops[0], size, insn)}"
+                       f", pg_{at:x} = {module.float_operand(ops[1], size, insn)};")
+            pending = ("fcom", f"pf_{at:x}", f"pg_{at:x}", size * 8)
             continue
-        if m in ("ptest", "vtestps", "vtestpd"):
+        if m in ("ptest", "vptest", "vtestps", "vtestpd"):
             # 它写 CF 与 ZF，所以不能只当一条 SIMD 指令塞进 `vec_line`——那条路的
             # 契约是"不碰标志"。
             #
@@ -565,13 +799,13 @@ def lift_function(code, rva):
             left = module.lane_ptr(ops[0], 0, insn)
             right = module.lane_ptr(ops[1], 0, insn)
             out.append(f"const uint8_t *lp{snap} = {left}, *rp{snap} = {right};")
-            out.append(f"uint64_t az{snap} = 0, cf{snap} = 0;")
+            out.append(f"uint64_t pz_{at:x} = 0, pc_{at:x} = 0;")
             out.append(f"for (unsigned k = 0; k < {size}u; k++) {{")
             out.append(f"    const uint8_t mk = (uint8_t)({sign});")
-            out.append(f"    az{snap} |= (uint64_t)(lp{snap}[k] & rp{snap}[k] & mk);")
-            out.append(f"    cf{snap} |= (uint64_t)(rp{snap}[k] & (uint8_t)~lp{snap}[k] & mk);")
+            out.append(f"    pz_{at:x} |= (uint64_t)(lp{snap}[k] & rp{snap}[k] & mk);")
+            out.append(f"    pc_{at:x} |= (uint64_t)(rp{snap}[k] & (uint8_t)~lp{snap}[k] & mk);")
             out.append("}")
-            pending = ("vtest", f"az{snap}", f"cf{snap}", 64)
+            pending = ("vtest", f"pz_{at:x}", f"pc_{at:x}", 64)
             continue
         if m in ("rol", "ror"):
             # 旋转写 CF 与 OF，保留 ZF/SF/PF/AF。所以夹一个旋转之后，相等与符号位
@@ -587,7 +821,8 @@ def lift_function(code, rva):
                 raise Refused(f"{m} without a compare")
             suffix = m[1:]
             cond = condition(pending, suffix)
-            pending = None
+            # A `jcc` reads the flags and writes none, so the compare is still
+            # the live one for the next consumer — the fall-through included.
             out.append(f"if ({cond}) goto L{ops[0].imm:#x};")
             continue
         if m == "jmp":
@@ -622,26 +857,50 @@ def lift_function(code, rva):
             snap += 1
             out.append(f"uint64_t a{snap} = {module.src(ops[0], insn)};")
             offset = str(ops[1].imm) if ops[1].type == capstone.x86.X86_OP_IMM else module.src(ops[1], insn)
-            out.append(f"uint64_t b{snap} = (a{snap} >> ({offset} & {bits - 1})) & 1;")
-            pending = ("cf", f"b{snap}", None, bits)
+            out.append(f"uint64_t pb_{at:x} = (a{snap} >> ({offset} & {bits - 1})) & 1;")
+            pending = ("cf", f"pb_{at:x}", None, bits)
             continue
         if m.startswith("set") or m.startswith("cmov"):
             suffix = m[3:] if m.startswith("set") else m[4:]
             if pending is None:
                 raise Refused(f"{m} without a compare")
             cond = condition(pending, suffix)
+            # Neither writes a flag: `setcc` writes a byte, `cmovcc` a register.
+            # So `cmp / setcc / setcc` and `cmp / cmovae / cmovb` — both are
+            # ordinary compiler output, the second reading the same comparison —
+            # stay legal until an instruction that really writes the flags runs.
             if m.startswith("set"):
-                # `setcc` writes a byte, not a flag: a second `setcc` reads the
-                # same comparison, and `cmp a,b / sete al / setb cl` is ordinary
-                # compiler output. Dropping `pending` here would refuse the
-                # second one, so it survives until something that really writes
-                # the flags runs.
                 out.append(module.wr(ops[0], f"({cond}) ? 1 : 0", insn))
-                continue
-            pending = None
-            out.append(f"if ({cond}) {module.wr(ops[0], module.src(ops[1], insn), insn)}")
+            else:
+                out.append(f"if ({cond}) {module.wr(ops[0], module.src(ops[1], insn), insn)}")
             continue
-        if m in ("adc", "sbb", "rcl", "rcr", "bts", "btr", "btc"):
+        if m in ("bts", "btr", "btc"):
+            # 位测试并置位/清位/取反：CF 拿到**改动之前**那一位，其余标志不动。
+            # 与 `bt` 同一条规则，所以用的是同一个 token 类型。
+            # 内存目标是另一回事：位号会跨字节寻址，这里只做寄存器。
+            if len(ops) != 2 or ops[0].type != capstone.x86.X86_OP_REG:
+                raise Refused(f"{m} into memory")
+            bits = module.width(ops[0])
+            idx = ops[1].imm & (bits - 1) if ops[1].type == capstone.x86.X86_OP_IMM \
+                else None
+            snap += 1
+            out.append(f"uint64_t pcb_{at:x};")
+            out.append("{")
+            out.append(f"    uint64_t x = (uint64_t)({module.src(ops[0], insn)});")
+            if idx is None:
+                out.append(f"    uint64_t b = (uint64_t)({module.src(ops[1], insn)}) "
+                           f"& {bits - 1};")
+            else:
+                out.append(f"    uint64_t b = {idx};")
+            out.append(f"    pcb_{at:x} = (x >> b) & 1;")
+            out.append(f"    x = {'x | ((uint64_t)1 << b)' if m == 'bts' else ''}"
+                       f"{'x & ~((uint64_t)1 << b)' if m == 'btr' else ''}"
+                       f"{'x ^ ((uint64_t)1 << b)' if m == 'btc' else ''};")
+            out.append("    " + module.wr(ops[0], "x", insn))
+            out.append("}")
+            pending = ("cf", f"pcb_{at:x}", None, bits)
+            continue
+        if m in ("adc", "sbb", "rcl", "rcr"):
             raise Refused(m)
         if m == "call":
             # The hardware pushes a return address at `rsp - 8` and enters the
@@ -673,13 +932,22 @@ def lift_function(code, rva):
             continue
         if m not in FLAG_SAFE and not flag_neutral(m):
             pending = None
+        # 进位与溢出要用到源操作数，而它马上就没了，所以在指令执行前存一份。
+        # 只在认得出来的 add/sub/and/or/xor 上存：其余形态的 CF 另有来处。
+        shape = alu_shape(m) if m in FLAG_FROM_RESULT else None
+        if shape is not None and len(ops) >= 2:
+            out.append(f"uint64_t pb_{at:x} = (uint64_t)({module.src(ops[1], insn)});")
+        elif shape not in ("inc", "dec"):
+            shape = None
         out.extend(module.lift_one(insn))
         if m in FLAG_FROM_RESULT:
             # ZF and SF are the result's, and the result is in the destination
             # now — but a later `mov` may overwrite it before the branch reads
             # the flag, so it is snapshotted here.
             snap += 1
-            out.append(f"uint64_t a{snap} = (uint64_t)({module.src(ops[0], insn)});")
-            pending = ("alu", f"a{snap}", None, module.width(ops[0]))
+            out.append(f"uint64_t pa_{at:x} = (uint64_t)({module.src(ops[0], insn)});")
+            pending = ("alu", f"pa_{at:x}",
+                       (shape, f"pb_{at:x}" if len(ops) >= 2 else "1") if shape else None,
+                       module.width(ops[0]))
     CALLS[rva] = calls
     return out
