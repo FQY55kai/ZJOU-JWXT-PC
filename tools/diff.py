@@ -179,11 +179,39 @@ SNIPPETS = [
     ("vpinsrd", ""), ("vpermilps", ""), ("vpextrd", ""),
     ("vcvtss2sd", ""), ("vpshufb", ""),
     ("bts", ("cf",)), ("btr", ("cf",)),
+    # 位测试的内存形式是另一条地址规则（位号 >> 3 定字节、& 7 定位，位号按有符号
+    # 解释），所以它与寄存器形式各要一个片段：第三种元素是操作数形状的过滤条件。
+    ("bt", ("cf",), "memreg"), ("bts", ("cf",), "memreg"),
+    ("btr", ("cf",), "memreg"), ("btc", ("cf",), "memreg"),
+    ("bts", ("cf",), "memimm"), ("btr", ("cf",), "memimm"),
     ("popcnt", ("cf", "zf", "sf", "of")), ("rorx", ""),
+    # 移位：四个标志全读。`shl` 的 CF 是移出去的最后一位、OF 是"符号变了吗"，
+    # `shr`/`sar` 的 OF 分别是原来的符号位与常量 0——三种各读一遍才分得清。
+    ("shl", ("cf", "zf", "sf", "of")), ("shr", ("cf", "zf", "sf", "of")),
+    ("sar", ("cf", "zf", "sf", "of")),
+    # 掩码访存：载入形式没选中的格子清零，存储形式没选中的格子不动内存
+    ("vpmaskmovd", ""), ("vpmaskmovq", ""), ("vmaskmovps", ""),
+    # 逐元素移位量、逐元素取小取大、立即数置换、打包精度换算、整块广播
+    ("vpsrlvd", ""), ("vpsravd", ""), ("vpminsd", ""), ("vpmaxud", ""),
+    ("vpermq", ""), ("vpermilpd", ""),
+    ("vcvtpd2ps", ""), ("vcvtps2pd", ""), ("vbroadcastf128", ""),
+    ("vcvttpd2dq", ""),
+    ("vpextrq", ""),
+    # 交替加减（上游这一轮新加的那一族）、逐元素乘法、绝对值、字节序反转
+    ("vaddsubps", ""), ("vaddsubpd", ""),
+    ("vpmulld", ""), ("vpmullw", ""), ("vpmuludq", ""), ("vpmaddwd", ""),
+    ("vpabsd", ""), ("bswap", ""),
+    # 带进位的加减：四个标志全读，另外补一条种子 `cmp` 让 CF 有定义
+    ("adc", ("cf", "zf", "sf", "of")), ("sbb", ("cf", "zf", "sf", "of")),
     ("vinserti128", ""), ("vpshuflw", ""), ("vpshufhw", ""), ("vhsubps", ""),
     ("vpcmpgtb", ""), ("vpcmpgtw", ""),
     ("vshufps", ""), ("vshufpd", ""), ("vunpcklps", ""), ("vpunpckhwd", ""),
     ("vhaddps", ""), ("vhaddpd", ""),
+    # 整数侧的水平加减：同一张表、同一段发射代码，只是元素宽度换了。饱和那两条
+    # 是唯一不能用 C 的 `+`/`-` 表达的，所以单独试。
+    ("phaddw", ""), ("phaddd", ""), ("phsubw", ""), ("phsubd", ""),
+    ("phaddsw", ""), ("phsubsw", ""),
+    ("vphaddd", ""), ("vphsubd", ""),
     ("vpmovmskb", ""), ("vmovmskps", ""), ("vmovmskpd", ""),
     ("vpsrad", ""), ("vpslld", ""), ("vpsrlq", ""), ("vpsllw", ""),
     ("vpsubb", ""), ("vpaddw", ""),
@@ -205,13 +233,37 @@ SNIPPETS = [
     ("vptest", ("cf", "zf")),
     # 整数侧：BMI1 位提取与计数、旋转、以及比较本身（czso 会走到这一轮新加的
     # js/jns 与 jo/jno 两条路径）
-    ("tzcnt", ""), ("lzcnt", ""), ("blsr", ""), ("blsi", ""),
+    ("tzcnt", ("cf", "zf")), ("lzcnt", ("cf", "zf")),
+    # BMI1 的三条"取最低位"：进位是"源是不是零"，溢出清零。`andn`/`bextr` 的
+    # 进位与溢出都是常量 0，`neg` 的借位是"源不是零"、溢出是"结果是那个最小值"。
+    ("blsr", ("of",)), ("blsi", ("of",)),
+    ("andn", ("cf", "of")), ("bextr", ("cf", "of")),
+    ("neg", ("cf", "zf", "sf", "of")),
+    ("shld", ""), ("shrd", ""),
+    # 双倍宽度的乘积：`mul` 无符号、单操作数 `imul` 有符号，128 位结果落在
+    # RDX:RAX。只比寄存器，不读标志——这两条的 SF/ZF/AF/PF 是未定义的。
+    ("mul", (), "oneop"), ("imul", (), "oneop"),
+    # 整块字节位移与跨 128 位通道的拼装、以及存成半精度的那个内存目标形式
+    ("pslldq", ""), ("psrldq", ""), ("vpslldq", ""), ("vpsrldq", ""),
+    ("vperm2f128", ""), ("vperm2i128", ""),
+    ("vcvtps2ph", "", "mem"),
     ("rol", ""), ("ror", ""),
     ("cmp", ("cf", "zf", "sf", "of")),
     # 四个标志全读一遍：`add`/`sub` 的 CF 与 OF 是这一轮新算出来的，只读 ZF 看不出对错
     ("add", ("cf", "zf", "sf", "of")), ("sub", ("cf", "zf", "sf", "of")),
     ("and", ("cf", "zf", "sf", "of")), ("xor", ("cf", "zf", "sf", "of")),
 ]
+
+
+# 有些指令读的是**前一条**指令留下的状态，单独放它就是一个必然被拒绝的片段：
+# `adc`/`sbb` 读 CF，而 CF 在函数入口没有定义。这一张表给它们补一条真实的、
+# 手写字节的种子指令（`cmp eax, ebx` 会按 eax-ebx 置 CF，种子寄存器每次都是随机的，
+# 所以“有进位”和“没进位”两类用例都会出现）。种子本身不改任何寄存器，
+# 只为了让 adc 有东西可读——这正是它在真实代码里的样子。
+SNIPPET_PREFIX = {
+    "adc": bytes.fromhex("39d8"),      # cmp eax, ebx
+    "sbb": bytes.fromhex("39d8"),
+}
 
 
 def snippet_code(flags):
@@ -269,14 +321,49 @@ def snippets(exe, work):
     # would address an unrelated place — sometimes mapped, sometimes not, and
     # never the same place it meant. What the compiler chose is what gets
     # tested: no assembler, and no hand-picked operands.
-    wanted = {name for name, _ in SNIPPETS}
+    #
+    # 同一条指令可以有多种操作数形状，而形状决定走哪条发射分支（`bts reg, reg`
+    # 在宽度内取模，`bts [mem], reg` 只取字节与位两段）。所以表项可以带第三个
+    # 元素当过滤条件，同一个名字出现两次就是两种形状各要一个实例。
+    shapes = {}
+    for entry in SNIPPETS:
+        shapes.setdefault(entry[0], []).append(entry[2] if len(entry) > 2 else None)
+    wanted = set(shapes)
     found = {}
+
+    def shape_ok(insn, tag):
+        if tag is None:
+            return True
+        mem = [n for n, op in enumerate(insn.operands)
+               if op.type == capstone.x86.X86_OP_MEM]
+        if tag == "mem":
+            return bool(mem)
+        if tag == "memreg":
+            return mem == [0] and len(insn.operands) == 2 \
+                and insn.operands[1].type == capstone.x86.X86_OP_REG
+        if tag == "memimm":
+            return mem == [0] and len(insn.operands) == 2 \
+                and insn.operands[1].type == capstone.x86.X86_OP_IMM
+        if tag == "oneop":
+            # 单操作数形式（`mul`、`imul` 的 128 位结果那一版）与两三个操作数
+            # 的同名指令是两条不同的指令，不能拿后者证明前者。
+            return len(insn.operands) == 1
+        raise SystemExit(f"unknown snippet shape {tag}")
+
+    pending = sum(len(tags) for tags in shapes.values())
     for at in range(0, len(table) - 11, 12):
         begin, end, _ = struct.unpack_from("<III", table, at)
         if not begin or end <= begin or end - begin > 4096:
             continue
         for insn in lift.MD.disasm(pe.get_data(begin, end - begin), begin):
-            if insn.mnemonic not in wanted or insn.mnemonic in found:
+            # `lock` 前缀下的助记符是 "lock btr" 一整个字符串，而片段表按内层
+            # 指令名索引——内存形式的位操作在这个映像里**只以 lock 形式出现**，
+            # 不剥掉前缀就一条也找不到。
+            name = insn.mnemonic[5:] if insn.mnemonic.startswith("lock ") else insn.mnemonic
+            if name not in wanted:
+                continue
+            tags = [t for t in shapes[name] if (name, t) not in found]
+            if not tags:
                 continue
             if any(op.type == capstone.x86.X86_OP_MEM
                    and op.mem.base and lift.MD.reg_name(op.mem.base) == "rip"
@@ -288,6 +375,12 @@ def snippets(exe, work):
             # instruction usually has a shorter displacement, so keep looking
             # instead of settling for an instance that would fault on both
             # sides and prove nothing.
+            if insn.mnemonic in ("shl", "sal", "shr", "sar") and (
+                    len(insn.operands) != 2
+                    or insn.operands[1].type != capstone.x86.X86_OP_IMM):
+                # 移位只在立即数（且非零）时建模标志；移位量在寄存器里的那些不是
+                # 这一轮的东西，跳过它们去找一条对得上的实例。
+                continue
             if not reachable(bytes(insn.bytes), 0):
                 continue
             # 片段以 `ret` 结尾，而 `ret` 用的是 rsp：任何写 rsp 的指令（最典型的是
@@ -297,36 +390,42 @@ def snippets(exe, work):
             if (first is not None and first.type == capstone.x86.X86_OP_REG
                     and lift.MD.reg_name(first.reg) in ("rsp", "esp", "sp")):
                 continue
-            found[insn.mnemonic] = bytes(insn.bytes)
-        if len(found) == len(wanted):
+            for tag in tags:
+                if shape_ok(insn, tag):
+                    found[(name, tag)] = bytes(insn.bytes)
+                    pending -= 1
+        if not pending:
             break
 
     # Lift each one before choosing where it goes: `branch` can still refuse,
     # and a refusal here is information — it says which instruction the round
     # has *not* covered, which is the opposite of what a passing count says.
     pieces, refused = [], []
-    for name, flags in SNIPPETS:
-        body = found.get(name)
+    for entry in SNIPPETS:
+        name, flags = entry[0], entry[1]
+        tag = entry[2] if len(entry) > 2 else None
+        body = found.get((name, tag))
+        shown = name if tag is None else f"{name}/{tag}"
         if body is None:
-            refused.append((name, "not in the image"))
+            refused.append((shown, "not in the image"))
             continue
-        code = body + snippet_code(flags)
+        code = SNIPPET_PREFIX.get(name, b"") + body + snippet_code(flags)
         # `branch.lift_function` gets exactly what the guest will execute, so the
         # bytes are the specification on both sides. rva is only ever used to
         # resolve rip-relative targets, and a snippet has none.
         try:
             lines = branch.lift_function(code, 0)
         except (branch.Refused, lift.Refused) as why:
-            refused.append((name, str(why)))
+            refused.append((shown, str(why)))
             continue
         if not lines:
-            refused.append((name, "lifted to nothing"))
+            refused.append((shown, "lifted to nothing"))
             continue
-        pieces.append((name, code, lines))
-        if os.environ.get("DIFF_DUMP") and name in os.environ["DIFF_DUMP"].split(","):
+        pieces.append((shown, code, lines))
+        if os.environ.get("DIFF_DUMP") and shown in os.environ["DIFF_DUMP"].split(","):
             one = lift.MD.disasm(body, 0)
             for i in one:
-                print(f"  [{name}] {i.mnemonic} {i.op_str}  {body.hex()}")
+                print(f"  [{shown}] {i.mnemonic} {i.op_str}  {body.hex()}")
             for l in lines:
                 print("     ", l)
 
@@ -786,9 +885,10 @@ def main():
                     at = [f"x{off // 32}[{(off % 32) // 8}]" for off in range(0, VEC_BYTES, 8)
                           if got_vec[off:off + 8] != want[2][off:off + 8]][:4]
                     if os.environ.get("DIFF_DUMP"):
+                        # `vin` is the entry vector as 64-bit lanes, not bytes.
                         at = [f"x{off // 32}[{(off % 32) // 8}] hw={want[2][off:off + 8].hex()}"
                               f"/c={got_vec[off:off + 8].hex()}"
-                              f"/in={bytes(vin[off // 32 * 32:off // 32 * 32 + 32]).hex()}"
+                              f"/in={' '.join(f'{vin[w]:016x}' for w in range(off // 8, off // 8 + 4))}"
                               for off in range(0, VEC_BYTES, 8)
                               if got_vec[off:off + 8] != want[2][off:off + 8]][:4]
                     clash.append("vector at " + ", ".join(at))

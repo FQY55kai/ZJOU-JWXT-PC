@@ -37,15 +37,33 @@ X2W 是目前**唯一**明确自述"x64 机器码 → C++ 静态重编译"并持
 - [ ] `switch.py`：两种跳转表模式 → `switch`，`B` 同址与索引可证的检查照抄
 - [ ] 差分比较加上"被写内存页的哈希"，不只比 16 个寄存器与 256 字节栈
 
-## 读上游这一轮（`e4e2b46d..a6967446`）：只有一条提交，且不在 CPU 侧
+## 读上游这一轮（`a6967446..fbe249f6`）：44 条提交，CPU 侧 3 条
+
+| 提交 | 内容 | 能不能吸收 |
+|---|---|---|
+| `bb1addf2` | `cpu: lower VEX.128/256 AVX horizontal and addsub FP ops in cpu_avx_horiz_fp_aot (#2629)`——`VHADDPS/PD`、`VHSUBPS/PD`、`VADDSUBPS/PD`，403 行升举器 + 1,229 行测试 | **部分吸收**。水平加/减本仓库已有（`VEC_HADD`，`vhsubps` 上一轮做过）；`VADDSUBPS/PD` 缺，按 SDM 补上（偶数通道**减**），片段差分判过一次 0/4 才对齐 |
+| `780c0bc4` | `cpu: lower 32/64-bit BMI2 BZHI, MULX, PDEP, and PEXT in cpu_bmi2_bit_aot (#2621)`——688 行 + 1,898 行测试 | **部分吸收**。`bzhi`/`mulx` 早就有；`pdep`/`pext` 在这个映像的拒绝面里**一次都没出现**（不到 3 个函数），所以记在这里、不写代码 |
+| `d371ce46` | `cpu: lower 16 VEX.256 AVX2 cross-lane extend and dword/qword unpack forms (#2614)`——`cpu_avx_int_aot.py` +136 行 | **已覆盖**。`VEC_EXTEND`（`pmovsx*`/`pmovzx*` 十二种）与 `VEC_UNPACK` 都在上一轮做过 |
+
+其余 41 条是 shader / startup / d3d12 / CI / 测试，没有指令语义。
+
+值得一提的两点对照：
+
+- 上游把 `VHADD`/`VADDSUB` 这一类拆成一个 403 行的专用模块，本仓库仍是 `lift.py` 里的两张表
+  （`VEC_HADD`、`VEC_ADDSUB`）加一个 `vec_line` 分支。**拆分的判据**还是那句：一张表能表达的
+  就不该是一个模块；`vaddsubps` 与 `vaddps` 只差"偶数通道反向"，它属于表，不属于文件。
+- 上游这一轮给 BMI2 配了 1,898 行测试，我们对应的是"一条指令一个函数"的片段差分（145 条 × 4 例）——
+  同样的想法（**每条指令单独可证**），落点不同：他们比的是自己两套实现的输出，我们比的是硬件。
+
+## 读上游上一轮（`e4e2b46d..a6967446`）：只有一条提交，且不在 CPU 侧
 
 | 提交 | 内容 | 能不能吸收 |
 |---|---|---|
 | `a6967446` | `cpu: harden atomic writes, path validation, and subprocess error handling in exe_aot with CLI suite (#2605)`——`exe_aot.py` 改成 `os.replace` 原子落盘、路径校验、子进程错误传播，附带约 750 行的 CLI 测试套件 | **没有指令语义**。原子落盘这一条本仓库早就在做：差分前先写一份 `snippets.exe` 副本、从不改原件（`tools/diff.py` 的 `snippets()`），正是同一个原因——半写好的文件会让下一次运行拿到一个既不是原版也不是补丁版的映像 |
 
-值得一提的对照：它这一轮把力气花在 **CLI 的健壮性**上，我们的对应物是 `diff.py` 的
+值得一提的对照：它那一轮把力气花在 **CLI 的健壮性**上，我们的对应物是 `diff.py` 的
 `--keep` 与逐例故障恢复——**"裁判自己不能先坏"** 是两棵树共同的结论，只是落点不同。
 
-上一轮读过、这一轮仍然成立的差异：上游按指令族拆成十几个 `cpu_*_aot.py`，本仓库只有一个 `lift.py`。
-本轮 `vec_line` 又长出 `VEC_APPROX`/`FMA`/`VEC_ROUND`/`VEC_EXTEND`/`VEC_PACK` 五张表，
+上游按指令族拆成十几个 `cpu_*_aot.py`，本仓库只有一个 `lift.py`。本轮 `vec_line` 又长出
+`VEC_ADDSUB`/`VEC_MUL`/`VEC_ABS`/`VEC_GATHER`/`VEC_MASKMOVE`/`VEC_VSHIFT`/`VEC_MINMAX` 七张表，
 **拆分的判据已经压到桌面上**（见 README §7 末段）。

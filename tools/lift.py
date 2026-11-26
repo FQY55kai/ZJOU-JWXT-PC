@@ -404,11 +404,28 @@ for _op, _sym in (("add", "+"), ("sub", "-")):
         VEC_INT_ARITH[f"p{_op}{_sz}"] = (_ch, _sym)
 del _op, _sym, _sz, _ch
 
-# Horizontal add. Per 128-bit lane the pairs collapse inside one source and then
-# inside the other: `haddps` gives a0+a1, a2+a3, b0+b1, b2+b3, and `haddpd`
-# alternates, a0+a1, b0+b1 — which is the same rule with two lanes instead of
-# four. The upper lane of a 256-bit register repeats it rather than mixing.
-VEC_HADD = {"haddps": 4, "haddpd": 8, "haddss": 0, "haddsd": 0}
+# Horizontal add and subtract. Per 128-bit lane the pairs collapse inside one
+# source and then inside the other: `haddps` gives a0+a1, a2+a3, b0+b1, b2+b3,
+# and `haddpd` alternates, a0+a1, b0+b1 — which is the same rule with two lanes
+# instead of four. The upper lane of a 256-bit register repeats it rather than
+# mixing.
+#
+# The integer forms are the same rule with a different element size, and that is
+# the whole of it: `phaddd` is `haddps` on dwords and `phaddw` on words, which
+# is why one table can hold all of them. `phsub*` negates the second half of
+# each pair. The three saturating names are the only ones that cannot be a plain
+# C `+`: they clamp to the element's range instead of wrapping, so their lines
+# are emitted separately below.
+#
+# `haddss`/`haddsd` stay at 0: the scalar forms add the low element *plus* the
+# second operand's low element, which is not a pair inside one register.
+VEC_HADD = {
+    "haddps": (4, "float", "+"), "haddpd": (8, "double", "+"),
+    "haddss": 0, "haddsd": 0,
+    "phaddw": (2, "int16_t", "+"), "phaddd": (4, "int32_t", "+"),
+    "phaddsw": (2, "int16_t", "SAT"), "phsubw": (2, "int16_t", "-"),
+    "phsubd": (4, "int32_t", "-"), "phsubsw": (2, "int16_t", "-SAT"),
+}
 
 # Packed shifts. The second number is the chunk, and the third says whether the
 # shift fills with the sign bit — which is why `psrad` is not `psrld` with a
@@ -461,12 +478,74 @@ del _s, _d, _k, _sign
 VEC_PACK = {"packsswb": (2, 1, True), "packssdw": (4, 2, True),
             "packuswb": (2, 1, False), "packusdw": (4, 2, False)}
 
+# 掩码访存：每个元素**自己的最高位**决定这一格走不走（SDM, VPMASKMOVD：`IF
+# SRC1[i+31] THEN ... FI`），所以一条指令里既读又跳过，不能用"读一整块、写一整块"
+# 的写法。数字是元素宽度。载入形式没选中的格子清零，存储形式没选中的格子**内存
+# 保持原样**——这两个不对称，是这条指令被单独实现的原因。
+VEC_MASKMOVE = {"pmaskmovd": 4, "pmaskmovq": 8, "maskmovps": 4, "maskmovpd": 8}
+
+# 交替加减：偶数元素加、奇数元素减（`addsubps` 按 32 位、`addsubpd` 按 64 位）。
+# 一条指令里两件事，所以不进 `VEC_FLOAT`。
+VEC_ADDSUB = {"addsubps": 4, "addsubpd": 8}
+
+# 逐元素乘法。宽的那半去哪一位、结果是有符号还是无符号，都由名字决定：
+# `pmullw` 取低 16 位，`pmulhw` 取高 16 位（有符号），`pmulhuw` 取高 16 位（无符号），
+# `pmulld` 取低 32 位。`pmuludq`/`pmaddwd` 的形状不同，单独处理。
+VEC_MUL = {"pmullw": (2, "low"), "pmulhw": (2, "high_s"),
+           "pmulhuw": (2, "high_u"), "pmulld": (4, "low")}
+
+# 逐元素取绝对值：有符号进，同宽无符号出。
+VEC_ABS = {"pabsb": 1, "pabsw": 2, "pabsd": 4}
+
+# 按索引表逐个取元素（`vpermps` 是浮点那一份，`vpermd` 是整数那一份，规则相同）：
+# 第 i 个输出取第 (索引[i] & 元素数-1) 个输入。与立即数置换的区别是索引是**数据**。
+VEC_GATHER = {"permps": 4, "permd": 4}
+
+# 每个元素自己的移位量（AVX2 的 `vpsrlvd` 一族）。移位数不是立即数，是**每个格子
+# 一个**，所以一条指令里可以有四个不同的移位量。SDM 的规则与标量移位不同：位数
+# 超过元素宽度不是"按位与"，而是结果直接饱和——逻辑移位得 0，算术移位得符号位。
+VEC_VSHIFT = {"psrlvd": (4, ">>"), "psravd": (4, "SAR"), "psllvd": (4, "<<"),
+              "psrlvq": (8, ">>"), "psllvq": (8, "<<")}
+
+# 逐元素取小/取大。符号是**指令**的：`pminsd` 按有符号比，`pminud` 按无符号比，
+# 两边的机器码只差一个前缀，结果却在 0x80000000 那一格分道扬镳。
+VEC_MINMAX = {}
+for _k in ("min", "max"):
+    for _w, _n in ((1, "b"), (2, "w"), (4, "d")):
+        for _s in ("s", "u"):
+            VEC_MINMAX[f"p{_k}{_s}{_n}"] = (_w, _s == "s", _k)
+del _k, _w, _n, _s
 
 
-VEC_STEMS = (set(VEC_MOVE) | set(VEC_LOGIC) | set(VEC_FLOAT) | set(VEC_BROADCAST)             | set(VEC_BLEND) | set(VEC_CMP_INT) | set(VEC_UNPACK)
+
+# 手写分支里的那几族：`lift_one` 里有些形态是逐条写的，不查表。它们同样是向量
+# 指令、同样不碰 EFLAGS，但不在任何一张表里，于是 `branch` 那侧把它们当成"改了
+# 标志"的指令——`shl`/`mov` 之外还会出现 `vcvtdq2ps` 这种根本不可能动标志的名字
+# 把前面那条比较作废。这张表就是补上那个缺口：一张"这个升举器认得哪些 mnemonic"
+# 的清单，和下面几张表并列，而不是让 `branch` 再抄一遍。
+VEC_ADHOC = {
+    "pshufd", "pshufb", "pshuflw", "pshufhw", "permilps",
+    "pextrb", "pextrw", "pextrd", "pextrq",
+    "pinsrb", "pinsrw", "pinsrd", "pinsrq",
+    "cvtss2sd", "cvtsd2ss", "cvtdq2ps", "cvttps2dq", "cvttpd2dq",
+    "cvtps2ph", "cvtph2ps", "cvtsi2ss", "cvtsi2sd",
+    "cvttss2si", "cvttsd2si",
+    "inserti128", "insertf128", "extracti128", "extractf128",
+    "hsubps", "hsubpd", "movlhps", "movhlps", "extractps",
+    "movlps", "movhps", "movlpd", "movhpd", "movddup",
+    "pslldq", "psrldq", "perm2f128", "perm2i128",
+}
+
+VEC_STEMS = (set(VEC_MOVE) | set(VEC_LOGIC) | set(VEC_FLOAT) | set(VEC_BROADCAST)
+             | set(VEC_BLEND) | set(VEC_CMP_INT) | set(VEC_UNPACK)
              | set(VEC_APPROX) | set(FMA)
              | set(VEC_INT_ARITH) | set(VEC_HADD) | set(VEC_SHIFT)
              | set(VEC_SIGN) | set(VEC_DUP) | set(VEC_SQRT)
+             | set(VEC_ROUND) | set(VEC_EXTEND) | set(VEC_PACK)
+             | set(VEC_MASKMOVE)
+             | set(VEC_VSHIFT) | set(VEC_MINMAX) | set(VEC_GATHER)
+             | set(VEC_ADDSUB) | set(VEC_MUL) | set(VEC_ABS)
+             | VEC_ADHOC
              | {"cmpps", "cmppd", "cmpss", "cmpsd", "shufps", "shufpd",
                 "shufss", "shufsd", "blendvps", "blendvpd", "pblendvb",
                 "pmovmskb", "movmskps", "movmskpd", "cvtsi2ss", "cvtsi2sd",
@@ -777,13 +856,15 @@ def vec_line(insn):
         lines.append("}")
         return lines
 
-    if stem == "pextrd":
-        # 四字节一个元素；写进 64 位寄存器时零扩展到 32 位。
+    if stem in ("pextrd", "pextrq"):
+        # 四字节/八字节一个元素；写进 64 位寄存器时窄的那个零扩展。
         if len(ops) != 3 or ops[2].type != capstone.x86.X86_OP_IMM:
             raise Refused(f"{m} arity")
         dst, source, sel = ops
+        step = 8 if stem == "pextrq" else 4
         index, _ = vec(source)
-        at = (f"(*(const uint32_t *)((const char *){lane(index)} + {4 * sel.imm}))")
+        at = (f"(*(const uint{step * 8}_t *)((const char *){lane(index)} + "
+              f"{step * sel.imm}))")
         return [wr(dst, at, insn)]
 
     if stem in ("cvtss2sd", "cvtsd2ss"):
@@ -964,9 +1045,18 @@ def vec_line(insn):
         if len(ops) not in (2, 3):
             raise Refused(f"{m} arity")
         dst, source = ops[0], ops[1]
-        if not is_vec(dst):
+        # `vcvtps2ph m64, xmm, imm` 是这条指令最常见的形态（把一整个向量压成
+        # 半精度存出去），目标不在寄存器里。内存目标只是换一个落点：写到
+        # `pd + 2*n` 而不是寄存器里，没有"其余清零"这回事，因为内存只收到
+        # 写进去的那几个字节。
+        if is_vec(dst):
+            index, width = vec(dst)
+            base = f"(char *){lane(index)}"
+        elif stem == "cvtps2ph" and dst.type == capstone.x86.X86_OP_MEM:
+            index, width = None, 0
+            base = f"(char *)(uintptr_t)({addr(dst, insn)})"
+        else:
             raise Refused(f"{m} to memory")
-        index, width = vec(dst)
         lines = ["{"]
         pt = (f"(const void *)(uintptr_t){addr(source, insn)}"
               if source.type == capstone.x86.X86_OP_MEM
@@ -984,16 +1074,16 @@ def vec_line(insn):
             for off in range(0, sw, 16):
                 lines.append(f"    {{ __m128i h = _mm_cvtps_ph(_mm_loadu_ps("
                              f"(const float *)(ps + {off})), {mode}); "
-                             f"memcpy((char *){lane(index)} + {off // 2}, &h, 8); }}")
+                             f"memcpy({base} + {off // 2}, &h, 8); }}")
             # 只写一半的字节数，剩下的（xmm 目标的高 8 字节）指令是清零的。
             written = (sw // 16) * 8
             if width > written:
-                lines.append(f"    memset((char *){lane(index)} + {written}, 0, "
+                lines.append(f"    memset({base} + {written}, 0, "
                              f"{width - written});")
         else:
             lines.append(f"    const char *ps = (const char *){pt};")
             for off in range(0, width, 16):
-                lines.append(f"    _mm_storeu_ps((float *)((char *){lane(index)} + {off}), "
+                lines.append(f"    _mm_storeu_ps((float *)({base} + {off}), "
                              f"_mm_cvtph_ps(_mm_loadu_si128((const __m128i *)"
                              f"(ps + {off // 2}))));")
         if width == 16 and vex:
@@ -1265,6 +1355,337 @@ def vec_line(insn):
         lines.append("}")
         return lines
 
+    if stem in VEC_MASKMOVE:
+        step = VEC_MASKMOVE[stem]
+        if len(ops) != 3:
+            raise Refused(f"{m} arity")
+        if ops[0].type == capstone.x86.X86_OP_MEM:
+            # 存储：掩码选中的格子才写回内存，其余原样不动。
+            index, width = vec(ops[2])
+            mask = vec(ops[1])[0]
+            lines = ["{"]
+            lines.append(f"const uint8_t *mk = (const uint8_t *){lane(mask)};")
+            lines.append(f"const uint8_t *rd = (const uint8_t *){lane(index)};")
+            lines.append(f"uint8_t *wr = (uint8_t *)(uintptr_t){addr(ops[0], insn)};")
+            for n in range(width // step):
+                off = step * n
+                lines.append(f"if (mk[{off + step - 1}] & 0x80) "
+                             f"memcpy(wr + {off}, rd + {off}, {step});")
+            lines.append("}")
+            return lines
+        index, width = vec(ops[0])
+        mask = vec(ops[1])[0]
+        if ops[2].type == capstone.x86.X86_OP_MEM:
+            at = f"(const uint8_t *)(uintptr_t){addr(ops[2], insn)}"
+        else:
+            at = f"(const uint8_t *){lane(vec(ops[2])[0])}"
+        lines = ["{"]
+        lines.append(f"const uint8_t *mk = (const uint8_t *){lane(mask)};")
+        lines.append(f"const uint8_t *rd = {at};")
+        for n in range(width // step):
+            off = step * n
+            lines.append(f"if (mk[{off + step - 1}] & 0x80) "
+                         f"memcpy((char *){lane(index)} + {off}, rd + {off}, {step});")
+            lines.append(f"else memset((char *){lane(index)} + {off}, 0, {step});")
+        if width == 16 and vex:
+            lines += ["    " + z for z in upper_zeroed(index)]
+        lines.append("}")
+        return lines
+
+    if stem in VEC_VSHIFT:
+        step, op = VEC_VSHIFT[stem]
+        if len(ops) != 3:
+            raise Refused(f"{m} arity")
+        dst, a, b = ops
+        index, width = vec(dst)
+        bits = step * 8
+        ut, st = f"uint{bits}_t", f"int{bits}_t"
+        lines = ["{"]
+        for n in range(width // step):
+            x = element(a, n, ut, step, insn)
+            c = element(b, n, ut, step, insn)
+            if op == "<<":
+                expr = f"(({c}) > {bits - 1} ? 0 : ({ut})(({x}) << ({c})))"
+            elif op == ">>":
+                expr = f"(({c}) > {bits - 1} ? 0 : ({ut})(({x}) >> ({c})))"
+            else:
+                # 算术右移过界不是 0，是符号位的复制——先升到 64 位再移，
+                # 32 位的符号在 int64_t 里还是那个符号。
+                expr = (f"(({c}) > {bits - 1} ? ({ut})((int64_t)({st})({x}) >> {bits - 1})"
+                        f" : ({ut})((int64_t)({st})({x}) >> ({c})))")
+            lines.append(f"    {ut} d{n} = {expr};")
+        for n in range(width // step):
+            lines.append(f"    memcpy((char *){lane(index)} + {step * n}, &d{n}, {step});")
+        if width == 16 and vex:
+            lines += ["    " + z for z in upper_zeroed(index)]
+        lines.append("}")
+        return lines
+
+    if stem in VEC_MINMAX:
+        step, signed, which = VEC_MINMAX[stem]
+        if len(ops) == 3:
+            dst, a, b = ops
+        elif len(ops) == 2:
+            dst, a, b = ops[0], ops[0], ops[1]
+        else:
+            raise Refused(f"{m} arity")
+        index, width = vec(dst)
+        t = f"{'int' if signed else 'uint'}{step * 8}_t"
+        rel = "<" if which == "min" else ">"
+        lines = ["{"]
+        for n in range(width // step):
+            x = element(a, n, t, step, insn)
+            y = element(b, n, t, step, insn)
+            lines.append(f"    {t} m{n} = ({x} {rel} {y} ? {x} : {y});")
+        for n in range(width // step):
+            lines.append(f"    memcpy((char *){lane(index)} + {step * n}, &m{n}, {step});")
+        if width == 16 and vex:
+            lines += ["    " + z for z in upper_zeroed(index)]
+        lines.append("}")
+        return lines
+
+    if stem in VEC_ADDSUB:
+        step = VEC_ADDSUB[stem]
+        if len(ops) == 3:
+            dst, a, b = ops
+        elif len(ops) == 2:
+            dst, a, b = ops[0], ops[0], ops[1]
+        else:
+            raise Refused(f"{m} arity")
+        index, width = vec(dst)
+        t = "double" if step == 8 else "float"
+        lines = ["{"]
+        for n in range(width // step):
+            # 偶数元素**减**、奇数元素加：SDM 的 `VADDSUBPS` 从 `DEST[31:0] :=
+            # SRC1 - SRC2` 起头，名字里的 "addsub" 是"加了又减"，不是顺序。
+            op = "-" if n % 2 == 0 else "+"
+            x = element(a, n, t, step, insn)
+            y = element(b, n, t, step, insn)
+            lines.append(f"    {t} d{n} = ({x}) {op} ({y});")
+        for n in range(width // step):
+            lines.append(f"    memcpy((char *){lane(index)} + {step * n}, &d{n}, {step});")
+        if width == 16 and vex:
+            lines += ["    " + z for z in upper_zeroed(index)]
+        lines.append("}")
+        return lines
+
+    if stem in VEC_MUL:
+        step, where = VEC_MUL[stem]
+        if len(ops) == 3:
+            dst, a, b = ops
+        elif len(ops) == 2:
+            dst, a, b = ops[0], ops[0], ops[1]
+        else:
+            raise Refused(f"{m} arity")
+        index, width = vec(dst)
+        ut, st = f"uint{step * 8}_t", f"int{step * 8}_t"
+        wide_u, wide_s = f"uint{step * 16}_t", f"int{step * 16}_t"
+        lines = ["{"]
+        for n in range(width // step):
+            x = element(a, n, ut, step, insn)
+            y = element(b, n, ut, step, insn)
+            if where == "low":
+                lines.append(f"    {ut} d{n} = ({ut})(({wide_u})({x}) * ({wide_u})({y}));")
+            elif where == "high_u":
+                lines.append(f"    {ut} d{n} = ({ut})((({wide_u})({x}) * ({wide_u})({y})) >> {step * 8});")
+            else:
+                lines.append(f"    {ut} d{n} = ({ut})((({wide_s})({st})({x}) * ({wide_s})({st})({y}))"
+                             f" >> {step * 8});")
+        for n in range(width // step):
+            lines.append(f"    memcpy((char *){lane(index)} + {step * n}, &d{n}, {step});")
+        if width == 16 and vex:
+            lines += ["    " + z for z in upper_zeroed(index)]
+        lines.append("}")
+        return lines
+
+    if stem in ("pmuludq", "pmuldq", "pmaddwd"):
+        # 三条"32 位元素两两乘、结果 64 位"的指令：前两条每 64 位通道只乘低 32 位
+        # （无符号/有符号），`pmaddwd` 把一对乘积相加后落成 32 位。
+        if len(ops) == 3:
+            dst, a, b = ops
+        elif len(ops) == 2:
+            dst, a, b = ops[0], ops[0], ops[1]
+        else:
+            raise Refused(f"{m} arity")
+        index, width = vec(dst)
+        lines = ["{"]
+        for n in range(width // 8):
+            x0 = element(a, 2 * n, "uint32_t", 4, insn)
+            y0 = element(b, 2 * n, "uint32_t", 4, insn)
+            if stem == "pmaddwd":
+                x1 = element(a, 2 * n + 1, "uint32_t", 4, insn)
+                y1 = element(b, 2 * n + 1, "uint32_t", 4, insn)
+                lines.append(f"    int64_t s{n} = (int64_t)(int32_t)({x0}) * (int64_t)(int32_t)({y0})"
+                             f" + (int64_t)(int32_t)({x1}) * (int64_t)(int32_t)({y1});")
+                lines.append(f"    uint64_t d{n} = (uint32_t)s{n};")
+            elif stem == "pmuludq":
+                lines.append(f"    uint64_t d{n} = (uint64_t)({x0}) * (uint64_t)({y0});")
+            else:
+                lines.append(f"    uint64_t d{n} = (uint64_t)((int64_t)(int32_t)({x0})"
+                             f" * (int64_t)(int32_t)({y0}));")
+        for n in range(width // 8):
+            lines.append(f"    v[{index}][{n}] = d{n};")
+        lines.append("}")
+        return lines
+
+    if stem in VEC_ABS:
+        step = VEC_ABS[stem]
+        if len(ops) == 3:
+            dst, a = ops[0], ops[2]
+        elif len(ops) == 2:
+            dst, a = ops
+        else:
+            raise Refused(f"{m} arity")
+        index, width = vec(dst)
+        st, ut = f"int{step * 8}_t", f"uint{step * 8}_t"
+        lines = ["{"]
+        for n in range(width // step):
+            x = element(a, n, st, step, insn)
+            lines.append(f"    {ut} d{n} = ({ut})(({x}) < 0 ? -({x}) : ({x}));")
+        for n in range(width // step):
+            lines.append(f"    memcpy((char *){lane(index)} + {step * n}, &d{n}, {step});")
+        if width == 16 and vex:
+            lines += ["    " + z for z in upper_zeroed(index)]
+        lines.append("}")
+        return lines
+
+    if stem in VEC_GATHER:
+        step = VEC_GATHER[stem]
+        if len(ops) != 3:
+            raise Refused(f"{m} arity")
+        dst, a, b = ops
+        index, width = vec(dst)
+        lanes = width // step
+        t = f"uint{step * 8}_t"
+        at = (f"(const uint8_t *)(uintptr_t){addr(a, insn)}" if a.type == capstone.x86.X86_OP_MEM
+              else f"(const uint8_t *){lane(vec(a)[0])}")
+        ct = (f"(const uint8_t *)(uintptr_t){addr(b, insn)}" if b.type == capstone.x86.X86_OP_MEM
+              else f"(const uint8_t *){lane(vec(b)[0])}")
+        lines = ["{",
+                 # 先把整份源抄进临时变量：目标与源常常是同一个寄存器，边读边写会把
+                 # 后面还要用的元素先覆盖掉。
+                 f"    {t} sv[{lanes}], ci[{lanes}];",
+                 f"    memcpy(sv, {at}, {width}u);",
+                 f"    memcpy(ci, {ct}, {width}u);"]
+        for n in range(lanes):
+            lines.append(f"    {t} g{n} = sv[ci[{n}] & {lanes - 1}];")
+        for n in range(lanes):
+            lines.append(f"    memcpy((char *){lane(index)} + {step * n}, &g{n}, {step});")
+        lines.append("}")
+        return lines
+
+    if stem == "psadbw":
+        # 每 8 个字节一组，组内逐字节求差的绝对值再求和——结果是一个 16 位的数，
+        # 零扩展成 64 位占满这一组。`psadbw` 因此是"两行像素差多远"那一条。
+        if len(ops) == 3:
+            dst, a, b = ops
+        elif len(ops) == 2:
+            dst, a, b = ops[0], ops[0], ops[1]
+        else:
+            raise Refused(f"{m} arity")
+        index, width = vec(dst)
+        pa = (f"(const uint8_t *)(uintptr_t){addr(a, insn)}" if a.type == capstone.x86.X86_OP_MEM
+              else f"(const uint8_t *){lane(vec(a)[0])}")
+        pb = (f"(const uint8_t *)(uintptr_t){addr(b, insn)}" if b.type == capstone.x86.X86_OP_MEM
+              else f"(const uint8_t *){lane(vec(b)[0])}")
+        lines = ["{",
+                 f"    const uint8_t *pa = {pa}, *pb = {pb};"]
+        for n in range(width // 8):
+            lines.append(f"    uint64_t s{n} = 0;")
+            lines.append(f"    for (unsigned k = 0; k < 8u; k++) {{")
+            lines.append(f"        int d = (int)pa[{8 * n} + k] - (int)pb[{8 * n} + k];")
+            lines.append(f"        s{n} += (uint64_t)(d < 0 ? -d : d);")
+            lines.append("    }")
+        for n in range(width // 8):
+            lines.append(f"    v[{index}][{n}] = s{n};")
+        lines.append("}")
+        return lines
+
+    if stem in ("permq", "permpd", "permilpd") and len(ops) == 3 \
+            and ops[2].type == capstone.x86.X86_OP_IMM:
+        # 立即数置换：`permq` 在整个 256 位里挑（四位、两位一个），`permilpd` 在
+        # 各自 128 位通道里挑（两位、一位一个）——控制位按通道重复，这是它与
+        # `permq` 唯一的区别。
+        dst, source, sel = ops
+        index, width = vec(dst)
+        if source.type == capstone.x86.X86_OP_MEM:
+            at = f"(const uint64_t *)(uintptr_t){addr(source, insn)}"
+        else:
+            at = f"(const uint64_t *){lane(vec(source)[0])}"
+        lines = ["{", f"    const uint64_t *ps = {at};"]
+        lanes = width // 8
+        for n in range(lanes):
+            if stem in ("permq", "permpd"):
+                q = (sel.imm >> (2 * n)) & 3
+            else:
+                q = (n & ~1) + ((sel.imm >> (n & 1)) & 1)
+            lines.append(f"    uint64_t q{n} = ps[{q}];")
+        for n in range(lanes):
+            lines.append(f"    v[{index}][{n}] = q{n};")
+        if width == 16 and vex:
+            lines += ["    " + z for z in upper_zeroed(index)]
+        lines.append("}")
+        return lines
+
+    if stem in ("cvtps2pd", "cvtpd2ps", "cvtdq2pd"):
+        # 精度换算的打包形式：`cvtpd2ps` 把双精度压成单精度，目标低半装满、其余
+        # 清零（256 位源压进 128 位目标时，上半也一起清）；`cvtps2pd` 反过来变宽，
+        # 目标写满。
+        if len(ops) != 2:
+            raise Refused(f"{m} arity")
+        dst, source = ops
+        if not is_vec(dst):
+            raise Refused(f"{m} to memory")
+        index, width = vec(dst)
+        sbytes = source.size if source.type == capstone.x86.X86_OP_MEM \
+            else vec(source)[1]
+        lines = ["{"]
+        if stem == "cvtps2pd":
+            for n in range(width // 8):
+                x = element(source, n, "float", 4, insn)
+                lines.append(f"    double d{n} = (double)({x});")
+            for n in range(width // 8):
+                lines.append(f"    memcpy((char *){lane(index)} + {8 * n}, &d{n}, 8);")
+        elif stem == "cvtdq2pd":
+            # 整数到双精度：32 位整数在 double 里是精确的，所以直接转换就是那条
+            # 指令，不经过任何舍入假设。
+            for n in range(width // 8):
+                x = element(source, n, "int32_t", 4, insn)
+                lines.append(f"    double d{n} = (double)({x});")
+            for n in range(width // 8):
+                lines.append(f"    memcpy((char *){lane(index)} + {8 * n}, &d{n}, 8);")
+        else:
+            for n in range(sbytes // 8):
+                x = element(source, n, "double", 8, insn)
+                lines.append(f"    float f{n} = (float)({x});")
+            for n in range(sbytes // 8):
+                lines.append(f"    memcpy((char *){lane(index)} + {4 * n}, &f{n}, 4);")
+            if width > 4 * (sbytes // 8):
+                lines.append(f"    memset((char *){lane(index)} + {4 * (sbytes // 8)}, 0, "
+                             f"{width - 4 * (sbytes // 8)});")
+        # VEX 的 128 位形式把上半清零，legacy 的留着不动——三条打包换算各差这一条
+        # 规矩，片段差分把它们一起指了出来（x[2]/x[3] 三处）。
+        if width == 16 and vex:
+            lines += ["    " + z for z in upper_zeroed(index)]
+        lines.append("}")
+        return lines
+
+    if stem in ("broadcastf128", "broadcasti128"):
+        # 把 128 位原封不动抄进两个通道（不是把某个元素撒开，所以不进
+        # `VEC_BROADCAST`）。源必须是内存，抄之前先读到临时变量里。
+        if len(ops) != 2:
+            raise Refused(f"{m} arity")
+        dst, source = ops
+        index, width = vec(dst)
+        at = f"(const uint8_t *)(uintptr_t){addr(source, insn)}"
+        lines = ["{", f"    const uint8_t *ps = {at};",
+                 "    uint64_t a0, a1;",
+                 "    memcpy(&a0, ps, 8); memcpy(&a1, ps + 8, 8);"]
+        for n in range(width // 16):
+            lines.append(f"    v[{index}][{2 * n}] = a0; v[{index}][{2 * n + 1}] = a1;")
+        lines.append("}")
+        return lines
+
     if stem in VEC_BROADCAST:
         size = VEC_BROADCAST[stem]
         if len(ops) != 2:
@@ -1414,8 +1835,7 @@ def vec_line(insn):
         return lines
 
     if stem in VEC_HADD and VEC_HADD[stem]:
-        ctype = "float" if stem == "haddps" else "double"
-        step = VEC_HADD[stem]
+        step, ctype, op = VEC_HADD[stem]
         if len(ops) == 3:
             dst, a, b = ops
         elif len(ops) == 2:
@@ -1427,6 +1847,12 @@ def vec_line(insn):
         index, width = vec(dst)
         per_lane = 16 // step
         half = per_lane // 2
+        limits = None
+        if op.endswith("SAT"):
+            limits = {2: ("INT16_MIN", "INT16_MAX"),
+                      4: ("INT32_MIN", "INT32_MAX")}.get(step)
+            if limits is None:
+                raise Refused(f"{m} saturate width")
         lines = ["{"]
         k = 0
         for base in range(0, width // step, per_lane):
@@ -1434,7 +1860,15 @@ def vec_line(insn):
                 for g in range(half):
                     x = element(source, base + 2 * g, ctype, step, insn)
                     y = element(source, base + 2 * g + 1, ctype, step, insn)
-                    lines.append(f"    {ctype} d{k} = ({x}) + ({y});")
+                    if limits:
+                        # 饱和：先按更宽的类型算，再夹回元素的取值范围。
+                        wide = "int32_t" if step == 2 else "int64_t"
+                        sign = "-" if op.startswith("-") else "+"
+                        lines.append(f"    {wide} s{k} = ({wide})({x}) {sign} ({wide})({y});")
+                        lines.append(f"    {ctype} d{k} = s{k} > {limits[1]} ? {limits[1]}"
+                                     f" : (s{k} < {limits[0]} ? {limits[0]} : ({ctype})s{k});")
+                    else:
+                        lines.append(f"    {ctype} d{k} = ({ctype})(({x}) {op} ({y}));")
                     k += 1
         for n in range(k):
             lines.append(f"    memcpy((char *){lane(index)} + {step * n}, &d{n}, {step});")
@@ -1493,6 +1927,77 @@ def vec_line(insn):
         lines.append(f"    memcpy((char *){lane(index)}, &d, {step});")
         if width == 16 and vex:
             lines += ["    " + z for z in upper_zeroed(index)]
+        lines.append("}")
+        return lines
+
+    if stem in ("pslldq", "psrldq"):
+        # 按**字节**在整个 128 位里移，不是按元素——这是它与 `psllq`/`psrlq` 的
+        # 全部区别：后者按 64 位元素各自移，元素之间不通。也没有 256 位形式。
+        # 计数超过 15 就把整个寄存器清零，而不是取模。
+        if len(ops) == 3:
+            dst, source, count = ops
+        elif len(ops) == 2:
+            dst, source, count = ops[0], None, ops[1]
+        else:
+            raise Refused(f"{m} arity")
+        if not is_vec(dst) or count.type != capstone.x86.X86_OP_IMM:
+            raise Refused(f"{m} form")
+        index, width = vec(dst)
+        if width != 16:
+            raise Refused(f"{m} width")
+        n = count.imm & 0xFF
+        lines = []
+        if source is not None:
+            # VEX 形式的目的寄存器不是源：先把源那一格搬过来再移位，否则移的是
+            # 目的寄存器里上一条指令留下的东西。
+            ptr = (f"(const void *)(uintptr_t)({addr(source, insn)})"
+                   if source.type == capstone.x86.X86_OP_MEM
+                   else f"(const void *){lane(vec(source)[0])}")
+            lines.append(f"memcpy({lane(index)}, {ptr}, 16);")
+        # `lane()` 是 `uint64_t *`：加 n 是加 8n 个字节，所以必须先在字节上算。
+        p = f"(char *){lane(index)}"
+        if n == 0:
+            pass
+        elif n > 15:
+            lines.append(f"memset({p}, 0, 16);")
+        elif stem == "pslldq":
+            lines.append(f"memmove({p} + {n}, {p}, {16 - n});")
+            lines.append(f"memset({p}, 0, {n});")
+        else:
+            lines.append(f"memmove({p}, {p} + {n}, {16 - n});")
+            lines.append(f"memset({p} + {16 - n}, 0, {n});")
+        if vex:
+            lines += upper_zeroed(index)
+        return lines
+
+    if stem in ("perm2f128", "perm2i128"):
+        # 两个源按 128 位拼成四格（a0 a1 b0 b1），低两位挑结果的低半、bit4-5 挑
+        # 高半；bit3 与 bit7 各自把那半边清零。四格里没有"来自自己"这一项——
+        # 目的寄存器是纯输出，所以可以先把结果拼在临时数组里再整块写回。
+        # `vperm2i128` 与 `vperm2f128` 是同一条规则的两种类型：编码分开只是为了
+        # 让整数代码不碰浮点单元，选择位的含义一模一样。
+        if len(ops) != 4 or not is_vec(ops[0]) or \
+                ops[3].type != capstone.x86.X86_OP_IMM:
+            raise Refused(f"{m} form")
+        index, width = vec(ops[0])
+        if width != 32:
+            raise Refused(f"{m} width")
+        mode = ops[3].imm & 0xFF
+
+        def half(op, n):
+            if op.type == capstone.x86.X86_OP_MEM:
+                return f"(const void *)(uintptr_t)({addr(op, insn)} + {16 * n})"
+            return f"(const void *)((const char *){lane(vec(op)[0])} + {16 * n})"
+
+        lines = ["{", "    char t[32];"]
+        for out_half, pick, zero in ((0, mode & 3, mode & 8),
+                                     (1, (mode >> 4) & 3, mode & 0x80)):
+            if zero:
+                lines.append(f"    memset(t + {16 * out_half}, 0, 16);")
+            else:
+                op = ops[1] if pick < 2 else ops[2]
+                lines.append(f"    memcpy(t + {16 * out_half}, {half(op, pick & 1)}, 16);")
+        lines.append(f"    memcpy({lane(index)}, t, 32);")
         lines.append("}")
         return lines
 
@@ -1572,6 +2077,40 @@ def vec_line(insn):
             return [f"memcpy((void *)(uintptr_t){addr(dst, insn)}, "
                     f"(const char *){lane(index)} + {at}, {size});"]
         raise Refused(f"{m} form")
+
+    if stem == "cvttpd2dq":
+        # 双精度截断成 32 位整数，只写目标的一半：两个 double 进去、两个字出来，
+        # 剩下的字节清零。它不需要 MXCSR——截断没有舍入模式可选，这正是它与
+        # `vcvtpd2dq` 的全部区别（后者按 MXCSR 舍入，所以仍然拒绝）。
+        if len(ops) != 2:
+            raise Refused(f"{m} arity")
+        dst, source = ops
+        if not is_vec(dst):
+            raise Refused(f"{m} to memory")
+        index, width = vec(dst)
+        if width != 16:
+            raise Refused(f"{m} width")
+        sw = vec(source)[1] if is_vec(source) else ops[1].size
+        lanes = sw // 8
+        if lanes not in (2, 4):
+            raise Refused(f"{m} source width")
+        lines = ["{"]
+        for n in range(lanes):
+            # 越界与 NaN 都落到 INT32_MIN（"integer indefinite"），不是 C 强转的
+            # 未定义行为。边界写成 double：写成 float 时 -2147483649.0 会舍成
+            # -2^31，把合法值排除掉。
+            lines.append(f"    double f{n} = {element(source, n, 'double', 8, insn)};")
+            lines.append(f"    int32_t w{n} = (f{n} > -2147483649.0 && f{n} < 2147483648.0)"
+                         f" ? (int32_t)f{n} : INT32_MIN;")
+        for n in range(lanes):
+            lines.append(f"    memcpy((char *){lane(index)} + {4 * n}, &w{n}, 4);")
+        rest = width - 4 * lanes
+        if rest:
+            lines.append(f"    memset((char *){lane(index)} + {4 * lanes}, 0, {rest});")
+        if vex:
+            lines += ["    " + z for z in upper_zeroed(index)]
+        lines.append("}")
+        return lines
 
     if stem in ("cvtdq2ps", "cvttps2dq"):
         if len(ops) != 2:
@@ -1889,8 +2428,37 @@ def lift_one(insn):
         # has to come off there too or a `jz` after `lock dec` is refused for
         # not having a compare.
         m = m[5:]
-    if m in ("nop", "endbr64", "pause"):
+    if m.startswith("prefetch"):
+        # 预取是给缓存控制器的提示：不改寄存器、不改内存、连无效地址都不报故障。
+        # 架构上它什么都没做，所以这里也没有可执行的内容——但不能拒绝，否则整条
+        # 函数会被一条提示废掉。
+        return []
+    if m in ("bswap", "movbe"):
+        # 字节序反转：`bswap` 在寄存器上转，`movbe` 在访存时就地转。`_byteswap_*`
+        # 就是这条指令，不是"重写语义"；只有 32/64 位有这条指令，16 位编码未定义。
+        if m == "movbe":
+            if len(ops) != 2:
+                raise Refused("movbe arity")
+            bits = ops[0].size * 8
+            fn = {16: "_byteswap_ushort", 32: "_byteswap_ulong",
+                  64: "_byteswap_uint64"}.get(bits)
+            if fn is None:
+                raise Refused(f"movbe {bits}-bit")
+            if ops[0].type == capstone.x86.X86_OP_MEM:
+                return [f"*(uint{bits}_t *)(uintptr_t)({addr(ops[0], insn)}) = "
+                        f"{fn}((uint{bits}_t){src(ops[1], insn)});"]
+            return [wr(ops[0], f"{fn}((uint{bits}_t)(*(const uint{bits}_t *)"
+                               f"(uintptr_t)({addr(ops[1], insn)})))", insn)]
+        bits = ops[0].size * 8
+        fn = {32: "_byteswap_ulong", 64: "_byteswap_uint64"}.get(bits)
+        if fn is None:
+            raise Refused(f"bswap {bits}-bit")
+        return [wr(ops[0], f"{fn}((uint{bits}_t){src(ops[0], insn)})", insn)]
+    if m in ("nop", "endbr64", "pause", "mfence", "lfence", "sfence"):
         # `pause` is the spin-wait hint: it changes nothing a program can read.
+        # 三条栅栏管的是**别的核**看到内存的顺序。这个移植只有一个核，也没有别的
+        # 核在看，所以它们没有可执行的内容——但也不能拒绝：拒绝会让整条函数作废，
+        # 而它们的语义在这里本来就是空的。
         return []
     if m == "int3":
         # The only `int3` a release build emits is the one MSVC puts after a
@@ -1995,6 +2563,57 @@ def lift_one(insn):
             raise Refused("alu arity")
         op = {"add": "+", "sub": "-", "and": "&", "or": "|", "xor": "^"}[m]
         return [wr(ops[0], f"{src(ops[0], insn)} {op} {src(ops[1], insn)}", insn)]
+    if m in ("mul", "imul") and len(ops) == 1:
+        # 单操作数形式是**双倍宽度**的乘积：RAX 乘以操作数，128 位结果落在
+        # RDX:RAX。这与 `imul r, r/m` 不是同一条指令（那条只留低半、还自带符号）。
+        # `_umul128`/`_mul128` 各对应一个符号性，边界与硬件一致。
+        bits = ops[0].size * 8
+        if bits not in (8, 16, 32, 64):
+            raise Refused(f"{m} {bits}-bit")
+        x = src(ops[0], insn)
+        if bits == 8:
+            # `mul r/m8` 只写 AX：AL 是被乘数、AH 是结果高半，而 AX 落在 r[0]
+            # 的低 16 位里，上面的位不动。
+            if m == "mul":
+                return ["{",
+                        f"    uint32_t p = (uint32_t)(uint8_t)r[0] * (uint32_t)(uint8_t)({x});",
+                        "    r[0] = (r[0] & ~(uint64_t)0xFFFF) | (uint64_t)(p & 0xFFFF);",
+                        "}"]
+            return ["{",
+                    f"    int32_t p = (int32_t)(int8_t)r[0] * (int32_t)(int8_t)({x});",
+                    "    r[0] = (r[0] & ~(uint64_t)0xFFFF) | (uint64_t)((uint32_t)p & 0xFFFF);",
+                    "}"]
+        if bits == 16:
+            # 16 位这条没有 #DE 的风险（乘积总是装得下 32 位），所以它与 8 位
+            # 一起在这里，而 `div`/`idiv` 的 16 位形式仍然拒绝。
+            if m == "mul":
+                return ["{",
+                        f"    uint32_t p = (uint32_t)(uint16_t)r[0] * (uint32_t)(uint16_t)({x});",
+                        "    r[0] = (r[0] & ~(uint64_t)0xFFFF) | (uint64_t)(p & 0xFFFF);",
+                        "    r[2] = (r[2] & ~(uint64_t)0xFFFF) | (uint64_t)(p >> 16);",
+                        "}"]
+            return ["{",
+                    f"    int32_t p = (int32_t)(int16_t)r[0] * (int32_t)(int16_t)({x});",
+                    "    r[0] = (r[0] & ~(uint64_t)0xFFFF) | (uint64_t)((uint32_t)p & 0xFFFF);",
+                    "    r[2] = (r[2] & ~(uint64_t)0xFFFF) | (uint64_t)(((uint32_t)p >> 16) & 0xFFFF);",
+                    "}"]
+        if bits == 64:
+            if m == "mul":
+                return ["{", "    uint64_t hi;",
+                        f"    uint64_t lo = _umul128(r[0], (uint64_t)({x}), &hi);",
+                        "    r[0] = lo; r[2] = hi;", "}"]
+            return ["{", "    int64_t hi;",
+                    f"    int64_t lo = _mul128((int64_t)r[0], (int64_t)({x}), &hi);",
+                    "    r[0] = (uint64_t)lo; r[2] = (uint64_t)hi;", "}"]
+        if m == "mul":
+            return ["{",
+                    f"    uint64_t p = (uint64_t)(uint32_t)r[0] * (uint64_t)(uint32_t)({x});",
+                    "    r[0] = (uint64_t)(uint32_t)p;",
+                    "    r[2] = (uint64_t)(uint32_t)(p >> 32);", "}"]
+        return ["{",
+                f"    int64_t p = (int64_t)(int32_t)r[0] * (int64_t)(int32_t)({x});",
+                "    r[0] = (uint64_t)(uint32_t)p;",
+                "    r[2] = (uint64_t)(uint32_t)((uint64_t)p >> 32);", "}"]
     if m == "imul":
         if len(ops) == 1:
             raise Refused("one-operand imul")
@@ -2157,6 +2776,26 @@ def lift_one(insn):
             call = (f"_bzhi_u32((unsigned)(uint32_t){src(ops[1], insn)}, "
                     f"(unsigned)(uint32_t){src(ops[2], insn)})")
         return [wr(ops[0], call, insn)]
+    if m in ("shld", "shrd"):
+        # 双精度移位：目标移 n 位，空出来的位从**源**的高位补进来。n 为 0 时结果
+        # 是目标原值（也就不能写成 `x >> (bits - n)`——那是对位宽取模的移位，是
+        # 未定义行为，而且在 n=0 时会给出 0）。标志按 SDM 是 CF/OF 加结果那几位，
+        # 这一层只供结果，`branch` 那边照旧拒绝跨过它读标志。
+        if len(ops) != 3:
+            raise Refused(f"{m} arity")
+        bits = width(ops[0])
+        step = "<<" if m == "shld" else ">>"
+        back = ">>" if m == "shld" else "<<"
+        n = f"((uint32_t){src(ops[2], insn)} & {bits - 1})"
+        return [
+            "{",
+            f"    uint{bits}_t a = (uint{bits}_t){src(ops[0], insn)};",
+            f"    uint{bits}_t b = (uint{bits}_t){src(ops[1], insn)};",
+            f"    uint32_t n = {n};",
+            f"    uint{bits}_t d = n ? (uint{bits}_t)((a {step} n) | (b {back} ({bits} - n))) : a;",
+            "    " + wr(ops[0], "d", insn),
+            "}",
+        ]
     if m in ("div", "idiv"):
         # The one-operand form divides RDX:RAX and leaves quotient in RAX and
         # remainder in RDX — a 128-by-64 division no C operator performs. MSVC's
