@@ -600,14 +600,37 @@ def _reg_index(op):
     return module.SUBS[name][0] if name in module.SUBS else None
 
 
+_GUARD_BRANCHES = ("ja", "jae", "jb", "jbe", "jl", "jle", "jg", "jge",
+                   "je", "jne", "jz", "jnz")
+
+
 def _guard_bound(before, index):
-    """`cmp I, n; ja L` in front of the dispatch: the table holds n+1 entries."""
-    for insn in reversed(before[-4:]):
-        if insn.mnemonic in ("ja", "jae", "jb", "jbe"):
+    """`cmp I, n; ja L` in front of the dispatch: the table holds n+1 entries.
+
+    两条判据缺一不可，而它们各自负责一种错法：
+
+    - **窗口要够宽**。形状本身吃掉三条（`lea`/`movsxd`/`add`），上界又落在它们
+      前面一两条 —— 窗口只有四条时 `cmp rax, 0x28; ja` 正好被挤出去，上界退回
+      "没有"，于是读到第一条越界的 entry 才停，`0x87040` 那张 41 条的表格后面
+      的数据就被当成 case 吃了进来，解码器一头扎进半个指令里。
+    - **`cmp` 后面必须紧跟那条跳向表外的条件分支**。只放宽窗口不加这一条，就会
+      把更早的、同寄存器的无关比较当上界 —— 那是同一个错的另一头。
+
+    上界还得看着像一个下标（非负、不超过 4095），否则那是另一件事。
+    """
+    for k in range(len(before) - 1, -1, -1):
+        insn = before[k]
+        if insn.mnemonic != "cmp" or len(insn.operands) != 2:
             continue
-        if insn.mnemonic == "cmp" and len(insn.operands) == 2:
-            if _reg_index(insn.operands[0]) == index and insn.operands[1].type == capstone.x86.X86_OP_IMM:
-                return insn.operands[1].imm
+        if _reg_index(insn.operands[0]) != index:
+            continue
+        if insn.operands[1].type != capstone.x86.X86_OP_IMM:
+            continue
+        n = insn.operands[1].imm
+        if not 0 <= n < 4096:
+            return None
+        follows = before[k + 1].mnemonic if k + 1 < len(before) else ""
+        return n if follows in _GUARD_BRANCHES else None
     return None
 
 
@@ -678,9 +701,11 @@ def walk(code, rva):
     starts = set()
     calls = set()
     dispatches = {}
-    todo = [rva]
+    # 待办项带着来源：一条边把解码器送进半个指令里时，"谁指的"是唯一能定位
+    # 的线索——`ff` 摆在那里只是症状。
+    todo = [(rva, None)]
     while todo:
-        at = todo.pop()
+        at, src = todo.pop()
         if at in starts or not rva <= at < end:
             continue
         starts.add(at)
@@ -690,7 +715,8 @@ def walk(code, rva):
                 break
             insn = next(module.MD.disasm(code[at - rva:at - rva + 15], at), None)
             if insn is None:
-                raise Refused("undecodable")
+                raise Refused("undecodable (entry)" if src is None
+                              else f"undecodable (from {src:#x})")
             insns[at] = insn
             m = insn.mnemonic
             nxt = at + insn.size
@@ -712,7 +738,7 @@ def walk(code, rva):
                     raise Refused("jmp without an operand")
                 if op.type == capstone.x86.X86_OP_IMM:
                     if rva <= op.imm < end:
-                        todo.append(op.imm)
+                        todo.append((op.imm, at))
                     else:
                         calls.add(op.imm)  # a tail call: the frame goes with it
                     break
@@ -728,7 +754,7 @@ def walk(code, rva):
                 dispatches[at] = table
                 for case in table["entries"]:
                     if rva <= case < end:
-                        todo.append(case)
+                        todo.append((case, at))
                     else:
                         raise Refused("jump table entry out of the function")
                 break
@@ -737,11 +763,11 @@ def walk(code, rva):
                 if op.type != capstone.x86.X86_OP_IMM:
                     raise Refused("indirect branch")
                 if rva <= op.imm < end:
-                    todo.append(op.imm)
+                    todo.append((op.imm, at))
                 else:
                     raise Refused("branch out of the function")
             recent.append(insn)
-            if len(recent) > 4:
+            if len(recent) > 8:
                 recent.pop(0)
             at = nxt
     return insns, starts, calls, dispatches
