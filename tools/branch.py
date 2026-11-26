@@ -96,6 +96,10 @@ FLAGLESS_STEMS = VEC_FLAGLESS | module.VEC_STEMS
 
 def flag_neutral(mnemonic):
     """True when the instruction leaves the arithmetic flags alone."""
+    if mnemonic.startswith("prefetch"):
+        # 预取是提示，不是运算：一条 `prefetchnta` 夹在比较与分支之间不会改变
+        # 任何可读状态，所以它不能把比较作废。
+        return True
     stem = mnemonic[1:] if mnemonic.startswith("v") else mnemonic
     return stem in FLAGLESS_STEMS or module.cmp_form(stem) is not None
 
@@ -103,10 +107,19 @@ def flag_neutral(mnemonic):
 # Instructions that leave the flags alone, so a compare stays live across them.
 # Everything else that is not a consumer invalidates it: a `cmp` followed by an
 # `add` and then a `jz` branches on the add, not on the compare.
+#
+# 这张表漏过两次，两次的表现完全一样：`cmp / <无害指令> / cmovcc` 被拒绝成
+# "cmovcc without a compare"——报的是消费者，错的却是这张表。所以凡是"升举器
+# 认识、且确实不写 EFLAGS"的名字都该在这里，哪怕它很少出现：
+# `rorx`（BMI2 的循环右移，不写标志正是它与 `ror` 的全部区别）、
+# `movbe`（就地反转字节，只写寄存器/内存）、三道栅栏、`clflush`、
+# `vzeroupper`/`vzeroall`（清 `255:128`，不碰 EFLAGS）。
 FLAG_SAFE = {
     "mov", "movabs", "movzx", "movsx", "movsxd", "lea", "not", "bswap", "nop",
     "push", "pop", "cbw", "cwde", "cdqe", "cdq", "cqo", "xchg", "endbr64",
-    "shlx", "shrx", "sarx", "mulx",
+    "shlx", "shrx", "sarx", "mulx", "rorx", "movbe",
+    "mfence", "lfence", "sfence", "clflush", "clflushopt", "pause",
+    "vzeroupper", "vzeroall",
     "sete", "setne", "sets", "setns", "seta", "setae", "setb", "setbe",
     "setg", "setge", "setl", "setle", "setc", "setnc", "seto", "setno",
     "setp", "setnp",
@@ -261,6 +274,10 @@ def carry_expression(pending):
         raise Refused(f"adc/sbb after {opk}, which keeps the carry")
     if kind == "cmp_nocf":
         raise Refused("adc/sbb after a rotate")
+    if kind == "mulf":
+        # 单操作数乘法的进位与溢出是同一位（"高半里有东西"），与 `condition`
+        # 里同一个式子。
+        return condition(pending, "b")
     if kind == "fcom":
         # `ucomiss` 的 CF 就是"无序或小于"那一位，与 `jb` 读的是同一位——所以
         # `adc` 接在浮点比较后面时，进位数是 `condition(..., "b")`。
@@ -286,6 +303,22 @@ def condition(pending, suffix):
             raise Refused(f"{suffix} is not one of the flags this join kept")
         return flags_condition(f"(fz_{a:x} != 0)", f"(fs_{a:x} != 0)",
                                f"(fc_{a:x} != 0)", f"(fo_{a:x} != 0)", suffix)
+    if kind == "mulf":
+        # 单操作数 `mul`/`imul`：只有 CF 与 OF 有定义，而且两者说的是同一件事
+        # ——"高半里有没有超出低半的东西"。无符号看高半非零，有符号看高半不是
+        # 低半的符号扩展。ZF/SF/AF/PF 未定义，所以 `jz`/`js` 照旧拒绝。
+        lo, signed = b
+        mask = (1 << bits) - 1
+        if signed:
+            expr = (f"((({a}) & {mask:#x}) != "
+                    f"((({lo}) >> {bits - 1}) & 1 ? {mask:#x} : 0))")
+        else:
+            expr = f"(({a}) != 0)"
+        if suffix in ("c", "b", "o"):
+            return expr
+        if suffix in ("nc", "ae", "no"):
+            return f"!{expr}"
+        raise Refused(f"mul leaves {suffix} undefined")
     if kind == "cf":
         # `BT` selects one bit into CF and leaves the rest untouched, so only
         # the carry conditions may read it.
@@ -355,6 +388,11 @@ def condition(pending, suffix):
         elif opk == "dec":
             cf = None
             of = f"((({a}) == ((({u})~0) >> 1)) ? 1 : 0)"
+        elif opk == "bzhi":
+            # 进位 = 索引（第三操作数的低 8 位）大于等于宽度，也就是"一位都没清"。
+            # 溢出清零；AF/PF 未定义。
+            cf = f"(((({bv}) & 0xFF) >= {bits}) ? 1 : 0)"
+            of = "0"
         elif opk == "bextr":
             # `bextr`：CF/OF 清零，SF/AF/PF 未定义——只留 equality 与进位条件。
             cf = "0"
@@ -732,6 +770,8 @@ def alu_shape(mnemonic):
         return "bls"
     if m == "neg":
         return "neg"        # 借位是"源不是零"，溢出是"结果是那个最小值"
+    if m == "bzhi":
+        return "bzhi"       # 进位是"index 超过宽度"，溢出清零
     if m == "popcnt":
         return "zero"       # CF/OF/SF 全清，只有 ZF 是结果的事
     if m in ("tzcnt", "lzcnt"):
@@ -833,6 +873,18 @@ def flag_step(pending, insn):
     # 只是动的不是上一个比较的那些，所以它不是 `FLAG_SAFE`，而是**新的**生产者。
     # 顺序写反的话，`xor eax,eax` 之后过一条边就查不到任何 token，块首的 `cmove`
     # 会被记成"without a compare"——真实原因却是查表把产生者当成了破坏者。
+    if m == "bzhi":
+        # BMI2 的"从第 index 位起清零"。ZF/SF 是结果的，CF 是"index 超过宽度"，
+        # OF 清零——而 AF/PF 未定义，所以只承认这四个里的三个。
+        return ("alu", f"pa_{at:x}", ("bzhi", f"pb_{at:x}"),
+                module.width(insn.operands[0]))
+    if m in ("mul", "imul") and len(insn.operands) == 1:
+        # 单操作数的乘积是**双倍宽度**的，所以 CF/OF 说的是"高半有没有东西"：
+        # 无符号看高半是不是零，有符号看高半是不是低半的符号扩展。其余四位
+        # （ZF/SF/AF/PF）在 SDM 里未定义，要它们的条件一律拒绝——`mul` 后面跟
+        # `jz` 是无意义的代码，不是我们该猜的东西。
+        return ("mulf", f"pch_{at:x}", (f"pcl_{at:x}", m == "imul"),
+                insn.operands[0].size * 8)
     if m in FLAG_FROM_RESULT:
         shape = alu_shape(m)
         if shape is not None and len(insn.operands) < 2                 and shape not in ("inc", "dec", "neg"):
@@ -1356,6 +1408,41 @@ def lift_function(code, rva):
             continue
         if m not in FLAG_SAFE and not flag_neutral(m):
             pending = None
+        if m in ("mul", "imul") and len(ops) == 1:
+            # 双倍宽度的乘积要在两条路径上算同一个东西：结果落进 RAX/RDX（或
+            # AX），而 CF/OF 要看高半。`lift_one` 把高半藏在块的局部变量里，外面
+            # 读不到，所以这里自己发射一对 `pcl_/pch_`——它们是那条指令的两个
+            # 出口，不是一个额外的模型。
+            bits = ops[0].size * 8
+            if bits in (32, 64):
+                x = module.src(ops[0], insn)
+                out.append("{")
+                if bits == 64:
+                    if m == "mul":
+                        out.append("    uint64_t hi;")
+                        out.append(f"    uint64_t lo = _umul128(r[0], (uint64_t)({x}), &hi);")
+                        out.append("    r[0] = lo; r[2] = hi;")
+                    else:
+                        out.append("    int64_t hi;")
+                        out.append(f"    int64_t lo = _mul128((int64_t)r[0], "
+                                   f"(int64_t)({x}), &hi);")
+                        out.append("    r[0] = (uint64_t)lo; r[2] = (uint64_t)hi;")
+                else:
+                    if m == "mul":
+                        out.append(f"    uint64_t p = (uint64_t)(uint32_t)r[0]"
+                                   f" * (uint64_t)(uint32_t)({x});")
+                        out.append("    r[0] = (uint64_t)(uint32_t)p;")
+                        out.append("    r[2] = (uint64_t)(uint32_t)(p >> 32);")
+                    else:
+                        out.append(f"    int64_t p = (int64_t)(int32_t)r[0]"
+                                   f" * (int64_t)(int32_t)({x});")
+                        out.append("    r[0] = (uint64_t)(uint32_t)p;")
+                        out.append("    r[2] = (uint64_t)(uint32_t)((uint64_t)p >> 32);")
+                out.append("}")
+                out.append(f"uint64_t pcl_{at:x} = (uint64_t)(r[0]);")
+                out.append(f"uint64_t pch_{at:x} = (uint64_t)(r[2]);")
+                pending = ("mulf", f"pch_{at:x}", (f"pcl_{at:x}", m == "imul"), bits)
+                continue
         # 进位与溢出要用到源操作数，而它马上就没了，所以在指令执行前存一份。
         # 只在认得出来的 add/sub/and/or/xor 上存：其余形态的 CF 另有来处。
         # 移位是唯一的例外——它的 `pb_` 存的是**被移的那个值**（也就是目标在移位
@@ -1364,9 +1451,12 @@ def lift_function(code, rva):
         # `neg` 的借位是"源不是零"，而源就是目标在取负之前的值——与移位同一个
         # 问题，同一个解法：写之前存一份。
         pre = m == "neg"
-        shape = alu_shape(m) if m in FLAG_FROM_RESULT else None
+        shape = alu_shape(m) if m in FLAG_FROM_RESULT or m == "bzhi" else None
         if shift is not None or pre:
             out.append(f"uint64_t pb_{at:x} = (uint64_t)({module.src(ops[0], insn)});")
+        elif m == "bzhi":
+            # `bzhi` 的进位问的是**索引**，也就是第三个操作数，不是第二个。
+            out.append(f"uint64_t pb_{at:x} = (uint64_t)({module.src(ops[2], insn)});")
         elif shape is not None and len(ops) >= 2:
             out.append(f"uint64_t pb_{at:x} = (uint64_t)({module.src(ops[1], insn)});")
         elif shape not in ("inc", "dec"):
@@ -1377,7 +1467,7 @@ def lift_function(code, rva):
             out.append(f"uint64_t pa_{at:x} = (uint64_t)({module.src(ops[0], insn)});")
             pending = ("alu", f"pa_{at:x}", (shift[0], f"pb_{at:x}", shift[1]),
                        module.width(ops[0]))
-        elif m in FLAG_FROM_RESULT:
+        elif m in FLAG_FROM_RESULT or m == "bzhi":
             # ZF and SF are the result's, and the result is in the destination
             # now — but a later `mov` may overwrite it before the branch reads
             # the flag, so it is snapshotted here.

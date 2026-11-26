@@ -175,7 +175,8 @@ SNIPPETS = [
     ("vpackssdw", ""), ("vpacksswb", ""), ("vpackuswb", ""), ("vpackusdw", ""),
     # 半精度转换、双字重排、抽一个字节、BMI2 的截断
     ("vcvtps2ph", ""), ("vcvtph2ps", ""), ("vpshufd", ""), ("vpextrb", ""),
-    ("bzhi", ""), ("vpextrw", ""), ("vextracti128", ""),
+    # `bzhi` 四个标志都读：ZF/SF 是结果的，CF 是"索引超过宽度"，OF 清零。
+    ("bzhi", ("cf", "zf", "sf", "of")), ("vpextrw", ""), ("vextracti128", ""),
     ("vpinsrd", ""), ("vpermilps", ""), ("vpextrd", ""),
     ("vcvtss2sd", ""), ("vpshufb", ""),
     ("bts", ("cf",)), ("btr", ("cf",)),
@@ -242,10 +243,14 @@ SNIPPETS = [
     ("shld", ""), ("shrd", ""),
     # 双倍宽度的乘积：`mul` 无符号、单操作数 `imul` 有符号，128 位结果落在
     # RDX:RAX。只比寄存器，不读标志——这两条的 SF/ZF/AF/PF 是未定义的。
-    ("mul", (), "oneop"), ("imul", (), "oneop"),
+    ("mul", ("cf", "of"), "oneop"), ("imul", ("cf", "of"), "oneop"),
     # 整块字节位移与跨 128 位通道的拼装、以及存成半精度的那个内存目标形式
     ("pslldq", ""), ("psrldq", ""), ("vpslldq", ""), ("vpsrldq", ""),
     ("vperm2f128", ""), ("vperm2i128", ""),
+    # 变量形式的逐元素重排，与立即数版不是同一套规则；`vpalignr` 按字节拼
+    ("vpermilps", "", "varctrl"), ("vpalignr", ""),
+    # 非临时存储：与普通存储逐字节相同，只是缓存提示
+    ("vmovntps", ""), ("vmovntpd", ""),
     ("vcvtps2ph", "", "mem"),
     ("rol", ""), ("ror", ""),
     ("cmp", ("cf", "zf", "sf", "of")),
@@ -348,6 +353,11 @@ def snippets(exe, work):
             # 单操作数形式（`mul`、`imul` 的 128 位结果那一版）与两三个操作数
             # 的同名指令是两条不同的指令，不能拿后者证明前者。
             return len(insn.operands) == 1
+        if tag == "varctrl":
+            # 第三操作数是控制字：寄存器或内存都算（这个映像里只有内存那种）。
+            return len(insn.operands) == 3 \
+                and insn.operands[2].type in (capstone.x86.X86_OP_REG,
+                                              capstone.x86.X86_OP_MEM)
         raise SystemExit(f"unknown snippet shape {tag}")
 
     pending = sum(len(tags) for tags in shapes.values())

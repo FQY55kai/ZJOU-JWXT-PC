@@ -256,7 +256,11 @@ for _i in range(16):
     VEC[f"ymm{_i}"] = (_i, 32)
 del _i
 
-VEC_MOVE = {"movaps", "movups", "movapd", "movupd", "movdqa", "movdqu", "lddqu"}
+# `movntps`/`movntpd`/`movntdq` 是**非临时**存储：只改一个缓存提示（"别把它留在
+# 缓存里"），数据落到哪、落在哪几个字节，与 `movaps` 逐字节相同。本移植没有缓存
+# 模型，也就没有可区别的东西——与预取同理，不能因为它少见就拒绝整条函数。
+VEC_MOVE = {"movaps", "movups", "movapd", "movupd", "movdqa", "movdqu", "lddqu",
+            "movntps", "movntpd", "movntdq", "movntdqa"}
 
 # Bitwise, three operands under VEX and two under SSE. `-` stands for "and not",
 # which is `~a & b` and is not a subtraction.
@@ -533,7 +537,7 @@ VEC_ADHOC = {
     "inserti128", "insertf128", "extracti128", "extractf128",
     "hsubps", "hsubpd", "movlhps", "movhlps", "extractps",
     "movlps", "movhps", "movlpd", "movhpd", "movddup",
-    "pslldq", "psrldq", "perm2f128", "perm2i128",
+    "pslldq", "psrldq", "perm2f128", "perm2i128", "palignr",
 }
 
 VEC_STEMS = (set(VEC_MOVE) | set(VEC_LOGIC) | set(VEC_FLOAT) | set(VEC_BROADCAST)
@@ -810,6 +814,66 @@ def vec_line(insn):
             for n in range(4):
                 lines.append(f"    memcpy((char *){lane(index)} + "
                              f"{u * 16 + 4 * n}, &s{u}{n}, 4);")
+        if width == 16 and vex:
+            lines += ["    " + z for z in upper_zeroed(index)]
+        lines.append("}")
+        return lines
+
+    if stem == "permilps" and len(ops) == 3 and \
+            (is_vec(ops[2]) or ops[2].type == capstone.x86.X86_OP_MEM):
+        # 变量形式：第三操作数**逐元素**给控制字，每格的低两位选源里同一通道的
+        # 哪一格。它和立即数形式是两条指令——立即数一条控制字管全部，这条每格
+        # 各管自己，所以不能共用那段代码。
+        dst, a, b = ops
+        if not is_vec(dst):
+            raise Refused(f"{m} to memory")
+        index, width = vec(dst)
+        pt = (f"(const uint8_t *)(uintptr_t){addr(a, insn)}"
+              if a.type == capstone.x86.X86_OP_MEM
+              else f"(const uint8_t *){lane(vec(a)[0])}")
+        lines = ["{", f"    const uint8_t *pa = {pt};"]
+        k = 0
+        for u in range(width // 16):
+            for n in range(4):
+                ctrl = element(b, u * 4 + n, "uint32_t", 4, insn)
+                lines.append(f"    uint32_t c{k} = ({ctrl}) & 3;")
+                lines.append(f"    uint32_t s{k}; memcpy(&s{k}, pa + {u * 16} + 4 * c{k}, 4);")
+                k += 1
+        for n in range(k):
+            lines.append(f"    memcpy((char *){lane(index)} + {4 * n}, &s{n}, 4);")
+        if width == 16 and vex:
+            lines += ["    " + z for z in upper_zeroed(index)]
+        lines.append("}")
+        return lines
+
+    if stem == "palignr":
+        # 把两个源按 `src1:src2` 拼成 32 字节再右移 imm 个**字节**，取低 16 字节。
+        # 256 位形式在**每个 128 位通道内部**各拼各的，不是把两个通道连起来。
+        # imm 超过 31 时结果是全零——不是把计数取模。
+        if len(ops) != 4 or ops[3].type != capstone.x86.X86_OP_IMM:
+            raise Refused(f"{m} arity")
+        dst, a, b = ops[0], ops[1], ops[2]
+        if not is_vec(dst):
+            raise Refused(f"{m} to memory")
+        index, width = vec(dst)
+        n = ops[3].imm & 0xFF
+        lanes = width // 16
+
+        def ptr(op):
+            if op.type == capstone.x86.X86_OP_MEM:
+                return f"(const void *)(uintptr_t){addr(op, insn)}"
+            return f"(const void *){lane(vec(op)[0])}"
+
+        lines = ["{", f"    char t[{32 * lanes}];"]
+        for u in range(lanes):
+            lines.append(f"    memcpy(t + {32 * u}, {ptr(b)}, 16);")
+            lines.append(f"    memcpy(t + {32 * u + 16}, {ptr(a)}, 16);")
+        for u in range(lanes):
+            if n < 32:
+                lines.append(f"    memcpy((char *){lane(index)} + {16 * u}, "
+                             f"t + {32 * u + n}, 16);")
+            else:
+                lines.append(f"    memset((char *){lane(index)} + {16 * u}, 0, 16);")
         if width == 16 and vex:
             lines += ["    " + z for z in upper_zeroed(index)]
         lines.append("}")
