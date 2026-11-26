@@ -37,7 +37,25 @@ X2W 是目前**唯一**明确自述"x64 机器码 → C++ 静态重编译"并持
 - [ ] `switch.py`：两种跳转表模式 → `switch`，`B` 同址与索引可证的检查照抄
 - [ ] 差分比较加上"被写内存页的哈希"，不只比 16 个寄存器与 256 字节栈
 
-## 读上游这一轮（`fbe249f6..2a801192`）：57 条提交，CPU 侧 2 条
+## 读上游这一轮（`2a801192..418f9245`）：34 条提交，CPU 侧 3 条
+
+| 提交 | 内容 | 能不能吸收 |
+|---|---|---|
+| `f14219f2` | `cpu: lift legacy SSE and VEX.128 AES-NI and PCLMULQDQ leaf functions to C++ (#2677)`——AES 轮函数族 + `PCLMULQDQ`（无进位乘法） | **吸收了一条**。这个映像里只出现 `vaesimc`（13 条，`aesimc` 的 VEX 形式，逆 MixColumns），落在约 10 个函数上；`aesenc`/`aesdec`/`aesenclast`/`aesdeclast` 一并接上（同一张表），`PCLMULQDQ` **这个映像里一次都没有**，不写。做法与 §5⑤ 一致：`_mm_aesimc_si128`/`_mm_aesenc_si128` 就是那些指令，AES 的 S 盒不该在 C 里重抄一遍 |
+| `22013b20` | `cpu: add legacy SSE4.1 FP AOT lifter and test suite (#2691)`——legacy（无 VEX）形式的 `ROUNDPS/PD`、`BLENDPS/PD`、`INSERTPS`、`PMOVSX*`/`PMOVZX*`、`PACKUSDW`、`PBLENDW`… | **已覆盖**。本仓库的表全部按**去 VEX 前缀的 stem** 索引，legacy 与 VEX 走同一条发射路径——`roundps`/`blendps`/`insertps`/`pmovsx*` 的两操作数形式本来就在（`VEC_ROUND`/`VEC_BLEND`/`VEC_EXTEND`）。它的价值在于**提醒**：同一张表被两种编码共用时，"目的寄存器同时是源"这条只有 legacy 形式成立，VEX 三操作数形式的目的不是源（这条我们上一轮在 `vpsrldq` 上踩过，见 README §5⑧） |
+| `ede9e4d3` | `cpu: lift 16/32/64-bit MOVBE load and store leaf functions to C++ (#2689)` | **已覆盖，但它订正了我们的一句注释**。`movbe` 的三种宽度本仓库都有（`_byteswap_ushort/ulong/uint64`），可注释里写着"只有 32/64 位有这条指令，16 位编码未定义"——**错的**：16 位带 `66` 前缀，SDM `MOVBE` 明确有 `r16/m16`，这个映像里 71 条。注释已改；代码本来就对，错的是说法 |
+
+其余 31 条是 runtime / tooling / shader / CI（`62946ccf`、`547a8c67`、`a9cfecf0` 一带是给各 `*_aot` CLI 补原子落盘与参数校验，
+`fd368513` 是 `pixel_aot` 的 binary16 辅助函数），没有指令语义。原子落盘本仓库早已在做（差分前写 `snippets.exe` 副本）。
+
+两条对照：
+
+- 上游把 AES 单独拆一个模块，本仓库是 `VEC_AES` 一张五条的表 + `vec_line` 的一个分支。判据仍是那句：
+  一张表能表达的就不该是一个模块——五条里只有"一源还是两源"不同，而这一点用表里的第二个字段就写完了。
+- 上游给 `PCLMULQDQ` 也配了实现，本仓库**不写**：这个映像里一次都没出现。这与 `PDEP`/`PEXT` 的处理一致——
+  用不上的实现比"看起来完整"的表更贵（每一次覆盖扫描都要多算一遍）。
+
+## 读上游上一轮（`fbe249f6..2a801192`）：57 条提交，CPU 侧 2 条
 
 | 提交 | 内容 | 能不能吸收 |
 |---|---|---|
@@ -69,7 +87,7 @@ X2W 是目前**唯一**明确自述"x64 机器码 → C++ 静态重编译"并持
 - 上游把 `VHADD`/`VADDSUB` 这一类拆成一个 403 行的专用模块，本仓库仍是 `lift.py` 里的两张表
   （`VEC_HADD`、`VEC_ADDSUB`）加一个 `vec_line` 分支。**拆分的判据**还是那句：一张表能表达的
   就不该是一个模块；`vaddsubps` 与 `vaddps` 只差"偶数通道反向"，它属于表，不属于文件。
-- 上游这一轮给 BMI2 配了 1,898 行测试，我们对应的是"一条指令一个函数"的片段差分（145 条 × 4 例）——
+- 上游这一轮给 BMI2 配了 1,898 行测试，我们对应的是"一条指令一个函数"的片段差分（154 条）——
   同样的想法（**每条指令单独可证**），落点不同：他们比的是自己两套实现的输出，我们比的是硬件。
 
 ## 读上游上一轮（`e4e2b46d..a6967446`）：只有一条提交，且不在 CPU 侧

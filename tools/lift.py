@@ -468,6 +468,16 @@ VEC_ROUND = {"roundps": (4, True), "roundpd": (8, True),
 ROUND_MODE = ("_MM_FROUND_TO_NEAREST_INT", "_MM_FROUND_TO_NEG_INF",
               "_MM_FROUND_TO_POS_INF", "_MM_FROUND_TO_ZERO")
 
+# AES-NI 的轮函数：名字对应 MSVC 里同名的那条 intrinsic，也就是这条指令本身。
+# 第二个数字是操作数个数——`aesimc` 只有一源，其余四个是"状态 + 轮密钥"。
+# 这个映像里用到的只有 `aesimc`（13 条），家族里其余几条一并接上：同一张表、
+# 同一段发射，多一条不多一行代码。
+VEC_AES = {"aesimc": ("_mm_aesimc_si128", 1),
+           "aesenc": ("_mm_aesenc_si128", 2),
+           "aesdec": ("_mm_aesdec_si128", 2),
+           "aesenclast": ("_mm_aesenclast_si128", 2),
+           "aesdeclast": ("_mm_aesdeclast_si128", 2)}
+
 # 窄到宽的元素扩展：每个输出元素是源里一个更窄的元素，符号扩展或零扩展。
 # 名字里的两个字母就是宽度——b/w/d/q 是 1/2/4/8 字节。
 _WIDTH_LETTER = {1: "b", 2: "w", 4: "d", 8: "q"}
@@ -532,12 +542,14 @@ VEC_ADHOC = {
     "pextrb", "pextrw", "pextrd", "pextrq",
     "pinsrb", "pinsrw", "pinsrd", "pinsrq",
     "cvtss2sd", "cvtsd2ss", "cvtdq2ps", "cvttps2dq", "cvttpd2dq",
+    "cvtps2dq", "cvtpd2dq",
     "cvtps2ph", "cvtph2ps", "cvtsi2ss", "cvtsi2sd",
     "cvttss2si", "cvttsd2si",
     "inserti128", "insertf128", "extracti128", "extractf128",
     "hsubps", "hsubpd", "movlhps", "movhlps", "extractps",
     "movlps", "movhps", "movlpd", "movhpd", "movddup",
     "pslldq", "psrldq", "perm2f128", "perm2i128", "palignr",
+    "aesimc", "aesenc", "aesdec", "aesenclast", "aesdeclast",
 }
 
 VEC_STEMS = (set(VEC_MOVE) | set(VEC_LOGIC) | set(VEC_FLOAT) | set(VEC_BROADCAST)
@@ -562,6 +574,16 @@ VEC_STEMS = (set(VEC_MOVE) | set(VEC_LOGIC) | set(VEC_FLOAT) | set(VEC_BROADCAST
 # that code: this module's own check and the differential harness. A helper
 # defined in only one of them is a link error in the other, found late.
 HELPERS = [
+    "#include <windows.h>",
+    "// `#DE` 是这个移植唯一需要自己发的故障，而且必须用**调用**发，不能指望把一次",
+    "// 除法留在原地：`_udiv128` 是纯 intrinsic，`if (q > 0xffff) q = _udiv128(d, 0, d,",
+    "// &rem)` 会被 /O1 if-convert 成无条件执行——商没越界的那一支也跟着崩。这是",
+    "// 本仓库第一次踩到**用一次会崩的指令当控制流**的坑：编译器有把纯运算搬出分支的",
+    "// 自由，而故障正是它搬走之后才发生的。`RaiseException` 是一次真有副作用的调用，",
+    "// 折不动；异常码 0xC0000094 就是硬件 `#DE` 在 Windows 上的那一个，收到它的处理器",
+    "// 分不出区别。（换到 POSIX 上这条该写成 raise(SIGFPE)。）",
+    "static __declspec(noreturn) void fault_divide(void) "
+    "{ RaiseException(0xC0000094u, 0, 0, 0); }",
     "// `popcnt` 用逐位归并算，而不是 intrinsic：`__popcnt` 在没开 /arch:SSE4.2 时",
     "// 会变成一次运行库调用，链接不上；而这条式子对任何宽度都是精确的。",
     "static uint64_t popcount64(uint64_t x) {",
@@ -625,6 +647,18 @@ def is_vec(op):
 
 def lane(index):
     return f"&v[{index}][0]"
+
+
+def src_vec(op, insn):
+    """A `__m128i` value for a vector operand, wherever it lives.
+
+    整条指令的 intrinsic 形态（AES 轮、按 MXCSR 舍入的转换）要的是 128 位值，
+    而不是逐元素读法。`_mm_loadu_si128` 恰好是"读 16 字节、不要求对齐"——与这些
+    指令对内存操作数的要求一样。
+    """
+    if op.type == capstone.x86.X86_OP_MEM:
+        return f"_mm_loadu_si128((const __m128i *)(uintptr_t){addr(op, insn)})"
+    return f"_mm_loadu_si128((const __m128i *){lane(vec(op)[0])})"
 
 
 def lane_at(op, n, insn):
@@ -1130,9 +1164,12 @@ def vec_line(insn):
             if sel is None or sel.type != capstone.x86.X86_OP_IMM:
                 raise Refused(f"{m} without a rounding mode")
             if sel.imm & 4:
-                # bit 2 让指令去读 MXCSR，这个移植没有建模它，不能猜。
-                raise Refused(f"{m} rounding from MXCSR")
-            mode = f"{ROUND_MODE[sel.imm & 3]} | _MM_FROUND_NO_EXC"
+                # bit 2 让指令去读 MXCSR。这个移植不建模它，但可以不算：
+                # `_MM_FROUND_CUR_DIRECTION` 编译出来就是 imm8 的 bit 2，
+                # 也就是同一条指令、同一份 MXCSR，舍入模式逐位相同。
+                mode = "_MM_FROUND_CUR_DIRECTION | _MM_FROUND_NO_EXC"
+            else:
+                mode = f"{ROUND_MODE[sel.imm & 3]} | _MM_FROUND_NO_EXC"
             sw = vec(source)[1] if is_vec(source) else ops[1].size
             lines.append(f"    const char *ps = (const char *){pt};")
             for off in range(0, sw, 16):
@@ -2176,6 +2213,73 @@ def vec_line(insn):
         lines.append("}")
         return lines
 
+    if stem in VEC_AES:
+        # 交给那条指令：AES 的一轮是 SubBytes/ShiftRows/MixColumns 的组合，用 C 写
+        # 一遍就是重写一张只有硬件说了算的表（S 盒），而 `_mm_aesenc_si128` 就是
+        # `aesenc`。非 VEX 形式只改低 128 位，VEX.128 连 255:128 一起清。
+        #
+        # 操作数个数不是"一族一个"：`aesimc` 一源，`aesenc`/`aesdec` 两源；VEX 的前缀
+        # 形式又是三操作数（目的、源1、源2），而 legacy 的两操作数形式目的**同时是**
+        # 源1。所以先看个数再决定谁是谁，不能按助记符写死。
+        fn, sources = VEC_AES[stem]
+        if len(ops) == 3 and vex:
+            dst, a, b = ops
+        elif len(ops) == 2:
+            dst, a, b = ops[0], ops[0], ops[1]
+        else:
+            raise Refused(f"{m} arity")
+        if not is_vec(dst):
+            raise Refused(f"{m} to memory")
+        index, width = vec(dst)
+        if width != 16:
+            raise Refused(f"{m} width")
+        # 一源的那条（`aesimc`）读的是**第二个**操作数；两源时 legacy 形式的目的
+        # 同时是源1，VEX 三操作数形式的源1 是 ops[1]。所以一源取 ops[-1]。
+        args = ([src_vec(ops[-1], insn)] if sources == 1
+                else [src_vec(a, insn), src_vec(b, insn)])
+        lines = ["{", f"    __m128i w = {fn}({', '.join(args)});",
+                 f"    memcpy({lane(index)}, &w, 16);"]
+        if vex:
+            lines += ["    " + z for z in upper_zeroed(index)]
+        lines.append("}")
+        return lines
+
+    if stem in ("cvtps2dq", "cvtpd2dq"):
+        # 按 MXCSR 舍入，不是截断，所以不能像 `cvttps2dq` 那样自己算——但也
+        # 不必自己算：`_mm_cvtps_epi32` 编译出来就是这一条 `cvtps2dq`，读的是
+        # 同一个线程里的同一份 MXCSR。舍入模式、越界与 NaN 的"整数不定值"
+        # 因此逐位相同，而"自己按默认模式算"只是在赌没人改过 MXCSR。
+        #
+        # 这个移植没有 `ldmxcsr`，MXCSR 永远是 CRT 启动时的那一份；即使有，
+        # 两侧读的也是同一份——这正是"让硬件再执行一次"比"把模式建模出来"更
+        # 可靠的地方。
+        if len(ops) != 2:
+            raise Refused(f"{m} arity")
+        dst, source = ops
+        if not is_vec(dst):
+            raise Refused(f"{m} to memory")
+        index, width = vec(dst)
+        step = 4 if stem == "cvtps2dq" else 8
+        ctype = "float" if step == 4 else "double"
+        fn = "_mm_cvtps_epi32" if step == 4 else "_mm_cvtpd_epi32"
+        load = "_mm_loadu_ps" if step == 4 else "_mm_loadu_pd"
+        sw = vec(source)[1] if is_vec(source) else ops[1].size
+        pt = (f"(const void *)(uintptr_t){addr(source, insn)}"
+              if source.type == capstone.x86.X86_OP_MEM
+              else f"(const void *){lane(vec(source)[0])}")
+        # 每个 128 位源块产出的字节数：四个单精度字，或两个字（`cvtpd2dq`
+        # 只写目标的一半，上半部分是零，intrinsic 已经这样返回）。
+        nbytes = 16 if step == 4 else 8
+        lines = ["{", f"    const char *ps = (const char *){pt};",
+                 f"    memset({lane(index)}, 0, {width}u);"]
+        for off in range(0, sw, 16):
+            lines.append(f"    {{ __m128i w = {fn}({load}((const {ctype} *)(ps + {off}))); "
+                         f"memcpy((char *){lane(index)} + {off // 16 * nbytes}, &w, {nbytes}); }}")
+        if width == 16 and vex:
+            lines += ["    " + z for z in upper_zeroed(index)]
+        lines.append("}")
+        return lines
+
     if stem in ("cvtdq2ps", "cvttps2dq"):
         if len(ops) != 2:
             raise Refused(f"{m} arity")
@@ -2498,8 +2602,10 @@ def lift_one(insn):
         # 函数会被一条提示废掉。
         return []
     if m in ("bswap", "movbe"):
-        # 字节序反转：`bswap` 在寄存器上转，`movbe` 在访存时就地转。`_byteswap_*`
-        # 就是这条指令，不是"重写语义"；只有 32/64 位有这条指令，16 位编码未定义。
+        # 字节序反转：`bswap` 在寄存器上转，`movbe` 在访存时就转。`_byteswap_*`
+        # 就是这条指令，不是"重写语义"。`movbe` 三种宽度都有（16 位带 66 前缀，
+        # SDM `MOVBE`，这个映像里 71 条）；`bswap` 只有 32/64。上游 `ede9e4d3`
+        # 这一轮升举的正是"16/32/64-bit MOVBE"，与这张表一一对上。
         if m == "movbe":
             if len(ops) != 2:
                 raise Refused("movbe arity")
@@ -2867,21 +2973,78 @@ def lift_one(insn):
         # so a divisor of zero or a quotient that does not fit raises the same
         # #DE here as it does in the original. Faults are left to propagate:
         # catching them would mean inventing behaviour the hardware does not have.
+        # 这句话只对 64 位形式成立——窄形式的两条差别见下。
+        #
+        # 8 位、16 位与 32 位都不是那个形状：它们的被除数各自装在一个 64 位整数里
+        # （AX、DX:AX、EDX:EAX），而 `_udiv128` 的头两个参数是**高 64 位**与低
+        # 64 位。把 `EDX:EAX` 的 EDX 当高 64 位传进去，等于把被除数乘了 2^32——
+        # 商从 2^32 那一档开始就全错，而且这个错躲得过两条 #DE（除零与商放不下
+        # 都只在 EDX 相对除数很大时才触发），所以差分里看着是"对"的。
+        #
+        # 第二条不一致在阈值：`_udiv128` 只在商越过 **2^64** 时 #DE，而
+        # `div r/m32` 在商越过 2^32 时就该 #DE。所以窄形式自己判：除数零、商越过
+        # 宽度，两处都走 `fault_divide()`——一次真的调用，不会被折到分支外
+        # （`_udiv128(d, 0, d)` 那种"用一次会崩的除法发 #DE"会被 if-convert，
+        # 见 HELPERS 里那段注释）。除法本身用 high=0 的 64/64，它不会自己 #DE。
         if len(ops) != 1:
             raise Refused(f"{m} arity")
         bits = ops[0].size * 8
-        if bits not in (32, 64):
+        if bits not in (8, 16, 32, 64):
             raise Refused(f"{m} {bits}-bit")
+        if bits != 64:
+            mask = (1 << bits) - 1
+            # 被除数：8 位形式是 AX 自己（正好 16 位），16 位是 DX:AX，32 位是 EDX:EAX。
+            dvd = ("(uint64_t)(r[0] & 0xFFFF)" if bits == 8 else
+                   f"((uint64_t)(r[2] & {mask:#x}) << {bits})"
+                   f" | (uint64_t)(r[0] & {mask:#x})")
+            if bits == 32:
+                # 32 位写会清零高半边，两个寄存器都是整覆盖。
+                out = ["    r[0] = (uint64_t)(uint32_t)q;",
+                       "    r[2] = (uint64_t)(uint32_t)rem;"]
+            elif bits == 16:
+                # 商写 AX、余数写 DX，两个寄存器的高半边都留着。
+                out = ["    r[0] = (r[0] & ~0xFFFFull) | (uint64_t)(q & 0xFFFF);",
+                       "    r[2] = (r[2] & ~0xFFFFull) | (uint64_t)(rem & 0xFFFF);"]
+            else:
+                # 商写 AL、余数写 AH：只有 AX 这一个 16 位窗口被动。
+                out = ["    r[0] = (r[0] & ~0xFFFFull) | (uint64_t)(q & 0xFF)"
+                       " | ((uint64_t)(rem & 0xFF) << 8);"]
+            divisor = src(ops[0], insn)
+            if m == "div":
+                lines = [
+                    "{",
+                    f"    uint64_t dvd = {dvd};",
+                    f"    uint64_t dvs = (uint64_t)(uint{bits}_t)({divisor});",
+                    "    uint64_t rem, q;",
+                    "    if (dvs == 0) fault_divide();",
+                    # high=0 且 dvs ≥ 1：这一步的商装得进 64 位，不可能自己 #DE，
+                    # 所以它可以无条件执行，也就可以被编译器随意搬动。
+                    "    q = _udiv128(0, dvd, dvs, &rem);",
+                    f"    if (q > {mask:#x}) fault_divide();",
+                ]
+            else:
+                lines = [
+                    "{",
+                    f"    int64_t dvd = (int{bits * 2}_t)({dvd});",
+                    f"    int64_t dvs = (int{bits}_t)({divisor});",
+                    "    int64_t rem, q;",
+                    "    if (dvs == 0) fault_divide();",
+                    "    q = _div128(dvd < 0 ? -1 : 0, (uint64_t)dvd, dvs, &rem);",
+                    # 两个界都要 `LL` 后缀：`-2147483648` 在 MSVC 的 C 解析里先按
+                    # 无符号取字面量，减号落在一个无符号值上，于是整条比较变成
+                    # **无符号**比较，`877241 < 2147483648` 恒真——每次除法都 #DE。
+                    f"    if (q < {-((mask + 1) // 2)}LL || q > {mask >> 1}LL) fault_divide();",
+                ]
+            return lines + out + ["}"]
+        # 64 位形式是唯一真的需要 128 位除数的一种：RDX 就是高 64 位，
+        # `_udiv128` 的 #DE 条件（高半 ≥ 除数）与指令的完全一致。
         signed = "u" if m == "div" else ""
         wide = f"{signed}int64_t"
-        high = "(r[2] & 0xFFFFFFFF)" if bits == 32 else "r[2]"
-        low = "(r[0] & 0xFFFFFFFF)" if bits == 32 else "r[0]"
-        back = "(uint64_t)(uint32_t)" if bits == 32 else "(uint64_t)"
         return [
             "{",
             f"    {wide} d = ({wide}){src(ops[0], insn)}, rem;",
-            f"    {wide} q = _{signed}div128({high}, {low}, d, &rem);",
-            f"    r[0] = {back}q; r[2] = {back}rem;",
+            f"    {wide} q = _{signed}div128(r[2], r[0], d, &rem);",
+            "    r[0] = (uint64_t)q; r[2] = (uint64_t)rem;",
             "}",
         ]
     if m in ("cmp", "test"):
@@ -3266,14 +3429,18 @@ def interpret(code, base_rva, regs, space=None):
             put(ops[0], ~get(ops[1]) & get(ops[2]))
         elif m in ("div", "idiv"):
             bits = ops[0].size * 8
-            if bits not in (32, 64):
+            if bits not in (8, 16, 32, 64):
                 raise Refused(f"{m} {bits}-bit")
             mask = (1 << bits) - 1
             # Read the divisor before touching rax/rdx: it may be `div rax`.
             raw = get(ops[0]) & mask
             if raw == 0:
                 raise Refused("divide by zero")
-            dividend = ((regs[2] & mask) << bits) | (regs[0] & mask)
+            # 8 位形式的被除数是 AX 本身，DX 不参与；其余形式是 RDX:RAX 的低 2*bits 位。
+            if bits == 8:
+                dividend = regs[0] & 0xFFFF
+            else:
+                dividend = ((regs[2] & mask) << bits) | (regs[0] & mask)
             if m == "idiv":
                 if dividend >> (2 * bits - 1):
                     dividend -= 1 << (2 * bits)
@@ -3288,8 +3455,18 @@ def interpret(code, base_rva, regs, space=None):
                 q, rem = divmod(dividend, raw)
                 if q > mask:
                     raise Refused("quotient overflows")
-            regs[0] = q & mask
-            regs[2] = rem & mask
+            if bits >= 32:
+                # 32 位写会清零高半边，64 位就是全宽，两种情况都是整寄存器覆盖。
+                regs[0] = q & mask
+                regs[2] = rem & mask
+            elif bits == 16:
+                keep = MASK64 ^ 0xFFFF
+                regs[0] = (regs[0] & keep) | (q & 0xFFFF)
+                regs[2] = (regs[2] & keep) | (rem & 0xFFFF)
+            else:
+                # 商在 AL、余数在 AH：AX 的 16 位窗口被两个半字节分开写。
+                regs[0] = ((regs[0] & (MASK64 ^ 0xFFFF))
+                           | (q & 0xFF) | ((rem & 0xFF) << 8))
         else:
             raise Refused(m)
     return space

@@ -244,6 +244,12 @@ SNIPPETS = [
     # 双倍宽度的乘积：`mul` 无符号、单操作数 `imul` 有符号，128 位结果落在
     # RDX:RAX。只比寄存器，不读标志——这两条的 SF/ZF/AF/PF 是未定义的。
     ("mul", ("cf", "of"), "oneop"), ("imul", ("cf", "of"), "oneop"),
+    # 除法：标志全部未定义，只比寄存器。8 位、16 位与 32 位形式各要一个片段——
+    # 它们的被除数分别是 AX、DX:AX、EDX:EAX，而同名的 64 位实例用不上。
+    # 片段靠 SNIPPET_SEED 把被除数压进不故障的区间。
+    ("div", "", "oneop32"), ("idiv", "", "oneop32"),
+    ("div", "", "oneop16"), ("idiv", "", "oneop16"),
+    ("div", "", "oneop8"), ("idiv", "", "oneop8"),
     # 整块字节位移与跨 128 位通道的拼装、以及存成半精度的那个内存目标形式
     ("pslldq", ""), ("psrldq", ""), ("vpslldq", ""), ("vpsrldq", ""),
     ("vperm2f128", ""), ("vperm2i128", ""),
@@ -252,6 +258,8 @@ SNIPPETS = [
     # 非临时存储：与普通存储逐字节相同，只是缓存提示
     ("vmovntps", ""), ("vmovntpd", ""),
     ("vcvtps2ph", "", "mem"),
+    # AES-NI：上游这一轮刚升举的那一族，这个映像里只用到 `aesimc`（逆 MixColumns）。
+    ("vaesimc", ""),
     ("rol", ""), ("ror", ""),
     ("cmp", ("cf", "zf", "sf", "of")),
     # 四个标志全读一遍：`add`/`sub` 的 CF 与 OF 是这一轮新算出来的，只读 ZF 看不出对错
@@ -268,6 +276,22 @@ SNIPPETS = [
 SNIPPET_PREFIX = {
     "adc": bytes.fromhex("39d8"),      # cmp eax, ebx
     "sbb": bytes.fromhex("39d8"),
+}
+
+# 有些指令"不故障"的输入区间太窄，随机种子几乎必然落在异常上：16 位 `div` 的
+# 被除数是 DX:AX（32 位），商却要放进 AX（16 位），随机种子下越界是常态。四个
+# 用例全变成"两侧都崩"，既不算比对也证明不了任何东西。所以片段可以声明要压住
+# 的寄存器：整数是常量，`("under", n)` 是 0..n 之间的随机值。压住的都是**被除数**
+# 那一半边，除数仍然是随机的——除零那条 #DE 该出现就还出现。
+SNIPPET_SEED = {
+    # 32 位这一条要 `rdx = 1` 而**不是** 0：被除数是 `EDX:EAX`，只有 EDX 非零时
+    # "EDX 是高 32 位、不是高 64 位"这件事才看得出来（EDX=0 时两种拼法都一样）。
+    "div/oneop32": {"rdx": 1},
+    "idiv/oneop32": {"rdx": 1},
+    "div/oneop16": {"rdx": 0},                        # DX=0 ⇒ 商 ≤ AX，必定放得下
+    "idiv/oneop16": {"rdx": 0, "rax": ("under", 0x8000)},
+    "div/oneop8": {"rax": ("under", 0x100)},          # AX ≤ 0xFF ⇒ 商必定放得下
+    "idiv/oneop8": {"rax": ("under", 0x80)},
 }
 
 
@@ -353,6 +377,10 @@ def snippets(exe, work):
             # 单操作数形式（`mul`、`imul` 的 128 位结果那一版）与两三个操作数
             # 的同名指令是两条不同的指令，不能拿后者证明前者。
             return len(insn.operands) == 1
+        if tag in ("oneop8", "oneop16", "oneop32"):
+            # 除法的 8/16/32 位形式各有自己的被除数（AX / DX:AX / EDX:EAX）与
+            # 自己的 #DE 阈值，同名的 64 位实例证明不了它们。
+            return len(insn.operands) == 1 and insn.operands[0].size == int(tag[5:]) // 8
         if tag == "varctrl":
             # 第三操作数是控制字：寄存器或内存都算（这个映像里只有内存那种）。
             return len(insn.operands) == 3 \
@@ -838,6 +866,9 @@ def main():
         for rva in live:
             regs = [ARENA + 0x1000 + rng.randrange(0, 0x800, 8) for _ in range(16)]
             regs[4] = RSP0
+            for name, value in SNIPPET_SEED.get(names.get(rva, ""), {}).items():
+                regs[lift.IDX[name]] = (value if isinstance(value, int)
+                                        else rng.randrange(0, value[1]))
             cases.append((rva, len(by_rva[rva]), regs, self_referential(rng), vector_state(rng)))
         if not cases:
             break
