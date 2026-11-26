@@ -110,6 +110,43 @@ PE 镜像 ──① 取边界 ──► 函数表 ──② 升举 ──► C �
 | `np`（奇偶标志 PF 没建模） | 2 | 要给每条 ALU 生产者补一个"结果低 8 位的奇偶"、给合并点加第五个出口变量，而它只在 `jnp`/`setp` 这类极少见的消费处才有用 |
 | 其余长尾 | 2 | `loopne`、`sete` 没有比较 |
 
+### HLE 面（68 个 DLL / 587 个导入，其中 **37 个必须我们写**）
+
+`cover.py` 数的是**能翻多少**，这一节数的是**要替掉多少**——两道墙，不一样高。函数逐个翻
+到 99.9%，结果仍然跑不起来，因为它导入的 587 个名字里有 37 个在 Windows 上**根本不存在任何形式**。
+
+`tools/hle.py` 把它算成数据（不是凭记忆列的清单），分类顺序就是加载器要试的顺序：
+
+| 判据 | 归谁 | 导入数 | DLL |
+|---|---|---|---|
+| `api-ms-win-*` / `ext-ms-win-*` | `host`——API set，Windows 自己解析 | 341 | 54 |
+| exe 旁边有同名 x64 PE | `title`——**用旁边那一份**，像 exe 一样映射进来 | 209 | 7（`MSVCP140` 113、`libHttpClient.GDK` 38、`Bink2Scarlett` 23、`VCRUNTIME140` 23、`XboxBvhBuilder` 7、`amd_fidelityfx_loader_xbox` 4、`VCRUNTIME140_1` 1） |
+| Windows 自带 | `host` | — | `WS2_32` 25、`WINHTTP` 15、`MFPlat` 6、`bcrypt` 3、`ADVAPI32` 3、`MFReadWrite` 1、`GameInput` 1 |
+| 其余 | **`ours`** | **37** | 见下 |
+
+**整个 HLE 面就是这 37 个名字，7 个 DLL：**
+
+| DLL | 数量 | 名字 |
+|---|---|---|
+| `xmem.dll` | 12 | `XMemAlloc` `XMemAllocDefault` `XMemAllocatePhysicalPages` `XMemFree` `XMemFreeDefault` `XMemFreePhysicalPages` `XMemGetWorkingSetStatistics` `XMemIsToolsMemAvailable` `XMemMapPhysicalPages` `XMemMapPhysicalPagesScatter` `XMemTransferMemory` `XMemVirtualAlloc` |
+| `AcpHal.dll` | 9 | `AcpHalCreate` `AcpHalAllocateShapeContexts` `AcpHalReleaseShapeContexts` `ApuAlloc` `ApuCreateHeap` `ApuFree` `ApuIsVirtualAddressValid` `ApuMapApuAddress` `ApuMapVirtualAddress` |
+| `chad.dll` | 5 | `XDspConnectWithMaximumStreamLimit` `XDspSubmitCommand` `XDspActivate` `XDspDeactivate` `XDspDisconnect` |
+| `xapu.dll` | 5 | `XApuConnect` `XApuEnqueueCommand` `XApuDequeueResult` `XApuGetResultCount` `XApuDisconnect` |
+| `d3d12_xs.dll` | 3 | `D3D12XboxCreateDevice` `D3D12ConfigureVirtualMemoryX` `D3D12SerializeVersionedRootSignature` |
+| `xg_xs.dll` | 2 | `XGCreateTextureComputer` `XGSuggestSwizzleMode` |
+| `XCRDAPI.dll` | 1 | `DStorageGetFactory`（转发到主机的 `dstorage.dll`） |
+
+`python tools/hle.py --emit hle` 生成 `table.c`（587 行）与 `stubs.c`（37 个**自报姓名**的桩）。
+桩不返回 0：一个安静的 0 会把标题的失败搬到别处才发作。两个文件在 `/W4` 下零警告。
+
+**一个把计划改掉的意外结论**：这 37 个名字在 `.text` 里**一个 direct call 都没有**，
+每个只有一处 `jmp [rip+iat]`。对照之下 `atan2f` 有 1,309 处、`QueryPerformanceCounter` 263 处、
+`qsort` 165 处——CRT 是直接调的，主机 API 不是。
+
+也就是说**导入表在启动时被解析成函数指针，之后全是间接调用**。所以"数调用点、把 0 次的挑掉"
+这条判据对它们根本不成立（`call=0` 一个不少）。HLE 要换的不是 IAT 里的值，是**解析那一刻
+交出去的那个指针**——这恰好也是加载器顺序里"ours 优先"唯一能生效的位置。
+
 ---
 
 ## 4. 三条被数据否定的路线

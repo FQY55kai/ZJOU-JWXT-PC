@@ -37,6 +37,28 @@ X2W 是目前**唯一**明确自述"x64 机器码 → C++ 静态重编译"并持
 - [ ] `switch.py`：两种跳转表模式 → `switch`，`B` 同址与索引可证的检查照抄
 - [ ] 差分比较加上"被写内存页的哈希"，不只比 16 个寄存器与 256 字节栈
 
+## 读上游这一轮（`418f9245..1ec01d70`）：18 条提交，**CPU 侧 0 条**
+
+先说结论：这 18 条里**没有一条**碰机器码升举。全部落在 `gfx2hlsl`（GFX ISA → HLSL）与
+`startup`（描述符/资源状态）两块。这不是偶然——它说明上游自己的重心已经从"把 x64 翻成 C"
+挪到了"把主机的 GPU 侧翻译掉"。我们这一轮也因此换了个方向：先数清楚 HLE 面（见 README
+「HLE 面」与 `tools/hle.py`），而不是继续在 0.1% 的函数上磨。
+
+| 组 | 提交 | 做的事 |
+|---|---|---|
+| GFX 指令覆盖（8 条） | `601eb621` `a766f287` `091c2a48` `8ece2649` `a768ebe0` `e6902a11` `1ec01d70` `651577a0` | `v_bfm_b32` 与缺失的 VOP2/VOP3；`v_sad_hi_u8`/`v_msad_u8`；compute VOP1 的 `bfrev`/`ffbh_i32`；`s_quadmask_b64`；`s_bfm_b64`；wave64 通道上的常量 lane SGPR 溢出；像素程序里带均匀分支/循环的 **DPP quad** 读；纯整数 VALU 之后**保持 wave-uniformity** |
+| 描述符与资源（4 条） | `786970ac` `caa24ad7` `83331487` `b408241e` | 没有 unordered access 的资源其 UAV 记为"未创建"；描述符字复制进 `vcc` 当作 `s[104:107]` 的上半；接受 compute waterfall 之后读的 key-independent body scalar；placed resource 包装分配失败 |
+| 诊断与测试（6 条） | `a5817910` `434aa90d` `7f2ed4ce` `6bf9bf1a` `fd033046` `2a9c252f` | `src_scc` 的 WARP 回读；给不支持的 implicit gather mip level **起个名字**（而不是报个数字）；一次表里两个复制的 raw vertex SRV；在 GPU 检查包里重放编译后的 compute 用例；并行负载下 `startup_run_ps1_check` 稳定；`startup_resource_address_index` 不受 MSVC Debug 迭代器检查影响 |
+
+三条值得记的：
+
+1. **"给错误起个名字"也算一条提交**（`434aa90d`）。我们没有这一步：`Refused` 的消息是给
+   直方图用的，而 `why.py` 得从异常回溯里把真凶挖出来。命名一次，比事后猜一次便宜。
+2. **wave-uniformity 是显式跟踪的属性**（`651577a0`），不是"看着像就行"。我们的对照物是
+   标志位的 token——同一个思路，只是他们跟的是"这个 lane 上的值对所有 lane 相同"。
+3. **测试稳定性是正经提交**（`fd033046`、`2a9c252f`）。我们的 `--rounds` 与 `SNIPPET_SEED`
+   是同一个问题的另一半：不确定的裁判等于没有裁判。
+
 ## 读上游这一轮（`2a801192..418f9245`）：34 条提交，CPU 侧 3 条
 
 | 提交 | 内容 | 能不能吸收 |

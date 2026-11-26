@@ -33,6 +33,30 @@
 > 上一版判断"要拿到逐位结果表才能做"是对的，但那份表不用自己造——intrinsic 直接给了。
 > 唯一代价是这几条指令要求宿主真的支持 AVX2/FMA，而原二进制本来就要求（否则它自己跑不起来）。
 
+## M0 —— HLE 面（进行中）
+
+翻译量到了 99.9%，导入面才刚数清楚：**68 个 DLL / 587 个导入，其中 37 个必须我们写**。
+这条路和升举是两条独立的墙——函数全翻对，跑不起来仍然是因为 `xgameruntime` 那类名字在
+Windows 上没有任何形式。
+
+- [x] `tools/hle.py`：按数据分类（API set → host；exe 旁边有 x64 PE → title；Windows 自带 →
+      host；其余 → ours），顺序即加载器要试的顺序
+- [x] `--emit` 生成 `table.c`（587 行）+ `stubs.c`（37 个自报姓名的桩），`/W4` 零警告
+- [ ] `hle_unimplemented`：把 `dll!name` 与调用它的返回地址一起打出来，再 abort（默认）；
+      `--unimplemented zero` 时只记一次并返回 0
+- [ ] `XCRDAPI!DStorageGetFactory` → 转发主机的 `dstorage.dll`（唯一一条纯转发）
+- [ ] `xmem.dll` 12 个：`XMemAlloc` 的 8 种 attributes 是主要难点；先做
+      `XMemAlloc`/`XMemFree`/`XMemAllocDefault`/`XMemFreeDefault` 四个，其余按使用频次
+- [ ] `d3d12_xs.dll` 3 个：`D3D12XboxCreateDevice` 是通往 GPU 侧的唯一入口，
+      `D3D12ConfigureVirtualMemoryX` 决定 UMA 怎么假装成不共享
+- [ ] `AcpHal`/`chad`/`xapu` 19 个：音频 DSP。标题在无声时也可能调它们（建堆），不能只做桩
+- [ ] `xg_xs.dll` 2 个：`XGCreateTextureComputer`（GPU 上的纹理转码）、`XGSuggestSwizzleMode`
+
+判据不成立的地方要如实说：本来打算"数调用点，把 0 次的挑出来"，结果**37 个全是 0 次 direct
+call**——每个只有一处 `jmp [rip+iat]`（对照 `atan2f` 的 1,309 处）。导入表在启动时被解析成
+函数指针，之后全是间接调用。所以下一件事变成了：**找到那个建表的地方**（取这些桩地址的
+`lea reg, [rip+thunk]` 与随后的存表），那才是"ours 优先"能插进去的唯一位置。
+
 ## M1 —— 调用与寻址（2–4 周）
 
 - [ ] 尾调用 `jmp` → `return f(args)`
